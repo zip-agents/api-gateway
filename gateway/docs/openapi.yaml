@@ -1,0 +1,230 @@
+# The API contract (PROMPT.md Part 2 and §14) as an OpenAPI document, written by hand.
+#
+# It describes a zip service as it is reached directly, exactly like the documents the
+# services generate for themselves: no servers, no authentication, no gateway errors.
+# The gateway adds all three, the same way, to this document and to each service's own
+# (gateway/openapi_view.py), and compares each service's document with this one
+# (/docs/compare). Keep it to what the contract requires.
+openapi: 3.1.0
+info:
+  title: Zip service contract
+  version: 1.1.0
+  description: |
+    The behaviour every implementation behind this gateway must provide
+    ([the contract](/docs/pages/contract), version 1.1.0). Each service also publishes
+    its own description of what it actually does; compare them in the portal.
+
+    **Streaming.** The archive is streamed as it is produced. The `200` status is sent at
+    the first file part, so a failure after that point cannot change the status: the
+    connection is closed and the archive is truncated (§6.2). Always check that the
+    archive you received is complete.
+
+    **Part order matters.** The optional `filename` field only takes effect if it is sent
+    *before* the first file part. Send one `files` part per file.
+paths:
+  /api/v1/zip:
+    post:
+      tags: [zip]
+      operationId: zipFiles
+      summary: Zip uploaded files
+      description: |
+        Upload one or more files as `multipart/form-data`; the response is a ZIP archive
+        containing them, streamed as it is compressed. Entry names are sanitised and
+        de-duplicated (`a.txt`, `a (1).txt`, ...), never rejected (§2.4).
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [files]
+              properties:
+                filename:
+                  type: string
+                  maxLength: 1024
+                  description: |
+                    Archive name. `.zip` is appended if missing. Defaults to
+                    `zipped_files.zip`. Must come before the first file part (§2.2, §2.3).
+                  examples: ["quarterly report"]
+                files:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items:
+                    type: string
+                    format: binary
+                  description: One part per file, in the order they should appear.
+            encoding:
+              files:
+                contentType: application/octet-stream
+      responses:
+        "200":
+          description: The archive, streamed with chunked transfer encoding (§3).
+          headers:
+            Content-Disposition:
+              schema: { type: string }
+              example: attachment; filename="quarterly report.zip"; filename*=UTF-8''quarterly%20report.zip
+            Cache-Control:
+              schema: { type: string, const: no-store }
+            X-Content-Type-Options:
+              schema: { type: string, const: nosniff }
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: "`malformed-request`, `no-files` or `unexpected-file-field`."
+          $ref: "#/components/responses/Problem"
+        "408":
+          $ref: "#/components/responses/Problem"
+        "413":
+          description: "`too-many-files` (§4), if reachable before streaming begins."
+          $ref: "#/components/responses/Problem"
+        "415":
+          $ref: "#/components/responses/Problem"
+        "422":
+          $ref: "#/components/responses/Problem"
+        "500":
+          $ref: "#/components/responses/Problem"
+        "503":
+          description: |
+            `overloaded` (with `Retry-After: 5`) or `shutting-down`. Retry later.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /health/live:
+    get:
+      tags: [health]
+      operationId: live
+      summary: Liveness (§8)
+      responses:
+        "200":
+          description: The process is running.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: ok }
+  /health/ready:
+    get:
+      tags: [health]
+      operationId: ready
+      summary: Readiness (§8)
+      responses:
+        "200":
+          description: Accepting work.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: ready }
+        "503":
+          description: Shutting down.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: shutting-down }
+  /docs/manifest.json:
+    get:
+      tags: [docs]
+      operationId: docsManifest
+      summary: Documentation manifest (§14.1)
+      responses:
+        "200":
+          description: The service's documents, version and build revision.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [version, revision, contract_version, documents]
+                properties:
+                  service: { type: string }
+                  version: { type: string }
+                  revision: { type: string }
+                  contract_version: { type: string }
+                  openapi:
+                    type: string
+                    description: Optional path of the service's own OpenAPI document.
+                  documents:
+                    type: array
+                    items:
+                      type: object
+                      required: [slug, title, path]
+                      properties:
+                        slug: { type: string }
+                        title: { type: string }
+                        path: { type: string }
+  /docs/{name}:
+    get:
+      tags: [docs]
+      operationId: docsDocument
+      summary: A document listed in the manifest (§14.2)
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+          example: README.md
+      responses:
+        "200":
+          description: The document.
+          content:
+            text/markdown:
+              schema: { type: string }
+        "404":
+          $ref: "#/components/responses/Problem"
+components:
+  parameters:
+    RequestId:
+      name: X-Request-ID
+      in: header
+      required: false
+      description: |
+        Your own request ID (`^[A-Za-z0-9._-]{1,128}$`). It is echoed back and appears in
+        the logs. One is generated if absent or invalid (§10).
+      schema:
+        type: string
+        pattern: "^[A-Za-z0-9._-]{1,128}$"
+  headers:
+    RequestId:
+      description: The request ID used in all logs for this request.
+      schema: { type: string }
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 Problem Details (§6.1).
+      required: [type, title, status, code, request_id]
+      properties:
+        type:
+          type: string
+          examples: ["urn:zip-service:problem:no-files"]
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        code:
+          type: string
+          examples: [no-files]
+        request_id: { type: string }
+  responses:
+    Problem:
+      description: An error reported before streaming began (§6.1).
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"

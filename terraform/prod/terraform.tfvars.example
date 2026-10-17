@@ -1,0 +1,4 @@
+# Copy to terraform.tfvars. It holds no secrets, so it can be committed.
+region           = "eu-west-2"
+hosted_zone_name = "example.com"     # created when you registered the domain in Route 53
+domain_name      = "zip.example.com" # or "example.com" to use the apex

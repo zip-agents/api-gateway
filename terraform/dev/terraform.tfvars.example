@@ -1,0 +1,3 @@
+# Optional: copy to terraform.tfvars to change the defaults. No secrets here.
+# region comes from AWS_REGION in platform.env.
+# local_url = "http://localhost:8080"

@@ -1,0 +1,32 @@
+# Smoke-test the live deployment over HTTPS, through the load balancer and the gateway:
+# every service's health, the contract example, errors, auth, a 32 MiB full-duplex
+# upload, and the docs endpoints. Nightly and on demand; each service's deploy workflow
+# runs its own post-deploy check.
+#
+# Needs repository variables DOMAIN_NAME and SMOKE_SERVICES (e.g. claude,grok), and the
+# secret SMOKE_API_KEY (from `make aws-api-keys`).
+name: live-smoke
+
+on:
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Smoke tests against https://${{ vars.DOMAIN_NAME }}
+        env:
+          GATEWAY_URL: https://${{ vars.DOMAIN_NAME }}
+          API_KEY: ${{ secrets.SMOKE_API_KEY }}
+          SERVICES: ${{ vars.SMOKE_SERVICES || 'claude,grok' }}
+        run: |
+          docker build -t zip-smoke smoke
+          docker run --rm --tmpfs /tmp:size=1g \
+            -e GATEWAY_URL -e API_KEY -e SERVICES -e LARGE_UPLOAD_MIB=32 zip-smoke

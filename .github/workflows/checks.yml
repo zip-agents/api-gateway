@@ -1,0 +1,43 @@
+# Static checks for the platform repository: no AWS access, no other repositories.
+name: checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  workflows-and-scripts:
+    name: Workflows and shell scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: actionlint (with shellcheck on run blocks)
+        run: make actions-lint
+      - name: shellcheck scripts/
+        run: make shellcheck
+
+  terraform:
+    name: Terraform fmt, validate, tflint, trivy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - run: make tf-check
+
+  killswitch:
+    name: Kill-switch Lambda tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - run: make test-lambda

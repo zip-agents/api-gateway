@@ -1,0 +1,47 @@
+.env
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+coverage.xml
+*.zip
+
+# The zip services are separate repositories, cloned side by side into these directories.
+# (The gateway lives in this repository, in gateway/.)
+/claude/
+/grok/
+/dsh-qwen3.8/
+
+# Terraform working files. State lives in S3; lock files (.terraform.lock.hcl) are committed.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*_override.tf
+# Kill-switch Lambda package, built by Terraform.
+/build/
+
+# Working plan, kept local on purpose.
+DEPLOYMENT_PLAN.md
+# Prompts given to the agents: working material, not part of the platform.
+prompts/
+
+# Local AWS settings for the Makefile.
+platform.env
+
+# Editor settings, and stray archives from trying the services by hand (also *.zip above).
+.idea/
+out.zip
+
+# Benchmark output (make perf).
+/perf/results/
+
+# Working material, kept local: the exercise brief and its prompt, notes, scratch commands.
+# gateway/docs/contract.md (built from PROMPT.md by scripts/sync-contract.sh) is committed.
+/PROMPT.md
+/NOTES.md
+/e2e-commands.sh
+/Senior Backend Engineer — Take-Home Exercise.pdf

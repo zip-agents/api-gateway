@@ -1,0 +1,23 @@
+# Trivy misconfiguration findings accepted by design (make tf-check fails on any other
+# HIGH or CRITICAL finding). Each entry says why. Re-check this list when trivy is upgraded:
+# check IDs occasionally change.
+
+# The load balancer is public: it is the platform's entry point.
+AVD-AWS-0053
+# Ports 80 and 443 are open to the internet on the load balancer only (80 redirects).
+AVD-AWS-0107
+# Tasks need outbound HTTPS to ECR, CloudWatch Logs and Secrets Manager through the NAT;
+# inbound rules are the boundary.
+AVD-AWS-0104
+# Wildcard resources only where the AWS action has no resource-level permissions
+# (ecr:GetAuthorizationToken, ecs:RegisterTaskDefinition, Describe*/List*), and for Cloud
+# Map service IDs, which are generated. See terraform/bootstrap/github.tf.
+AVD-AWS-0057
+# SNS topics carry budget alerts only, no customer data; AWS-managed encryption suffices.
+AVD-AWS-0095
+# State bucket uses SSE-S3 (AES256): a customer-managed KMS key adds cost and a key to
+# manage for no gain in a single-account demo.
+AVD-AWS-0132
+# The accounts database is encrypted with the AWS-managed RDS key. A customer-managed key
+# adds $1/month and key-policy control nobody else needs in a single-account demo.
+AVD-AWS-0079

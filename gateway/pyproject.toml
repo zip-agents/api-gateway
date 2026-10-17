@@ -1,0 +1,76 @@
+[project]
+name = "zip-gateway"
+version = "0.1.0"
+description = "Authenticating, streaming API gateway in front of the zip services"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "starlette>=1.8,<2",
+    "uvicorn[standard]>=0.54,<1",
+    "h11>=0.16,<0.17",
+    "markdown-it-py>=4.2,<5",
+    "pyyaml>=6.0.3,<7",
+    "sqlalchemy[asyncio]>=2.1,<2.2",
+    "alembic>=1.20,<2",
+    "asyncpg>=0.32,<0.33",
+    "aiosqlite>=0.22,<0.23",
+    # Cognito: OIDC sign-in (token endpoint, ID-token verification) and user admin
+    "httpx>=0.28,<1",
+    "pyjwt[crypto]>=2.10,<3",
+    "boto3>=1.40,<2",
+]
+
+[dependency-groups]
+dev = [
+    "coverage>=7.16",
+    "mypy>=2.4",
+    "pytest>=9.1",
+    "pytest-timeout>=2.4",
+    "types-pyyaml>=6.0.12",
+    "ruff>=0.17",
+]
+
+[tool.uv]
+# A deployable service, not a library: run with `python -m gateway` from this directory.
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers"
+timeout = 60
+# anyio's pytest plugin ships with starlette's anyio dependency; tests use @pytest.mark.anyio.
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "PT", "S"]
+# Asserts narrow types for mypy; python never runs with -O here.
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["gateway", "tests"]
+
+[[tool.mypy.overrides]]
+# boto3 ships no type hints; only accounts/directory.py uses it, behind Any.
+module = ["boto3", "boto3.*", "botocore.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+[tool.coverage.run]
+source = ["gateway"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

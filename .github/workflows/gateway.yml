@@ -1,0 +1,50 @@
+# The gateway (gateway/): lint, types and unit tests in the dev image, then build the
+# runtime image and check it starts hardened (read-only, no capabilities). Runs on
+# changes to the gateway, and is called by plan-apply before every gateway deploy.
+name: gateway
+
+on:
+  pull_request:
+    paths: ["gateway/**", "contract/**", ".github/workflows/gateway.yml"]
+  push:
+    branches: [main]
+    paths: ["gateway/**", "contract/**", ".github/workflows/gateway.yml"]
+  workflow_call:
+  workflow_dispatch:
+
+concurrency:
+  # Called from plan-apply, the run shares that workflow's ref; keep the two apart.
+  group: gateway-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Lint, types, tests (dev image)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - run: make -C gateway check
+
+  image:
+    name: Runtime image starts hardened
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build -t zip-gateway:ci gateway
+      - name: Start read-only with no capabilities, and answer health checks
+        run: |
+          key="$(od -An -tx1 -N24 /dev/urandom | tr -d ' \n')"
+          docker run -d --name gw --read-only --cap-drop ALL --security-opt no-new-privileges \
+            -p 8000:8000 -e GATEWAY_UPSTREAMS=claude=http://127.0.0.1:1 \
+            -e GATEWAY_API_KEYS="ci:$key" -e GATEWAY_SESSION_SECRET="$key$key" zip-gateway:ci
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/health/ready && exit 0
+            sleep 1
+          done
+          docker logs gw
+          exit 1

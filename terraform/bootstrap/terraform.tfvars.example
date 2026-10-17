@@ -1,0 +1,17 @@
+# Copy to terraform.tfvars. It holds no secrets, so it can be committed.
+region      = "eu-west-2"
+alert_email = "you@example.com"
+
+# owner/name of the repository each service deploys from. The keys name the services.
+# The gateway lives in the platform repository, so both point at it.
+github_repositories = {
+  platform = "OWNER/zip-platform"
+  gateway  = "OWNER/zip-platform"
+  claude   = "OWNER/zip-claude"
+  grok     = "OWNER/zip-grok"
+  dsh      = "OWNER/zip-dsh"
+}
+
+monthly_budget_usd = 100
+# false if the account already has GitHub's OIDC provider
+create_github_oidc_provider = true

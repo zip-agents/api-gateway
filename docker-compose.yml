@@ -1,0 +1,131 @@
+# Local integration of the gateway and the zip services, the same topology as on AWS
+# (docs/deployment.md): one container per service, only the gateway reachable from the host.
+#
+#   make up        build and start everything (dsh too, once it has a Dockerfile: make up-dsh)
+#   make smoke     run the smoke tests for every service through the gateway
+#   make down      stop and remove the containers
+#
+# The service directories are only read, as Docker build contexts.
+
+x-hardened: &hardened
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+  stop_grace_period: 30s
+
+x-zip-service: &zip-service
+  <<: *hardened
+  environment:
+    PORT: "8000"
+    LOG_LEVEL: INFO
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      # No spaces: Podman splits this argument on them (Docker does not).
+      - "__import__('urllib.request').request.urlopen('http://127.0.0.1:8000/health/ready',timeout=2)"
+    interval: 5s
+    timeout: 3s
+    retries: 12
+    start_period: 5s
+
+services:
+  claude:
+    <<: *zip-service
+    build:
+      context: ./claude
+      args:
+        GIT_SHA: ${CLAUDE_GIT_SHA:-unknown}
+    image: zip-claude:local
+
+  grok:
+    <<: *zip-service
+    build:
+      context: ./grok
+      args:
+        GIT_SHA: ${GROK_GIT_SHA:-unknown}
+    image: zip-grok:local
+
+  dsh:
+    <<: *zip-service
+    build:
+      context: ./dsh-qwen3.8
+      args:
+        GIT_SHA: ${DSH_GIT_SHA:-unknown}
+    image: zip-dsh:local
+    # Opt-in until the dsh service has a Dockerfile: `make up-dsh` or --profile dsh.
+    profiles: [dsh]
+
+  gateway:
+    <<: *hardened
+    build: ./gateway
+    image: zip-gateway:local
+    ports:
+      - "${GATEWAY_PORT:-8080}:8000"
+    environment:
+      PORT: "8000"
+      LOG_LEVEL: INFO
+      GATEWAY_UPSTREAMS: claude=http://claude:8000,grok=http://grok:8000,dsh=http://dsh:8000
+      GATEWAY_API_KEYS: ${GATEWAY_API_KEYS:?copy .env.example to .env (make env)}
+      GATEWAY_SESSION_SECRET: ${GATEWAY_SESSION_SECRET:?copy .env.example to .env (make env)}
+      # Plain HTTP on localhost; on AWS the ALB terminates TLS and this stays true.
+      GATEWAY_COOKIE_SECURE: "false"
+      # Accounts data (user API keys): the local Postgres below. Migrations run at startup.
+      GATEWAY_DATABASE_URL: postgresql+asyncpg://gateway:gateway@postgres:5432/gateway
+      # Sign-in with the dev Cognito pool and invite links: `make dev-auth` writes these
+      # into .env. Left empty, the portal offers API-key sign-in only.
+      GATEWAY_COGNITO_DOMAIN: ${GATEWAY_COGNITO_DOMAIN:-}
+      GATEWAY_COGNITO_CLIENT_ID: ${GATEWAY_COGNITO_CLIENT_ID:-}
+      GATEWAY_COGNITO_CLIENT_SECRET: ${GATEWAY_COGNITO_CLIENT_SECRET:-}
+      GATEWAY_COGNITO_USER_POOL_ID: ${GATEWAY_COGNITO_USER_POOL_ID:-}
+      GATEWAY_PUBLIC_URL: ${GATEWAY_PUBLIC_URL:-}
+      # An IAM user that can only manage users in the dev pool (terraform/dev).
+      AWS_ACCESS_KEY_ID: ${GATEWAY_DEV_AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${GATEWAY_DEV_AWS_SECRET_ACCESS_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      claude:
+        condition: service_healthy
+      grok:
+        condition: service_healthy
+      dsh:
+        condition: service_healthy
+        required: false
+
+  # Postgres for the gateway's accounts data (Aurora PostgreSQL on AWS). The data lives in
+  # the named volume: `make down` keeps it, `docker compose down -v` deletes it.
+  postgres:
+    image: postgres:16.14-alpine
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway
+      POSTGRES_DB: gateway
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "gateway"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+  smoke:
+    build: ./smoke
+    image: zip-smoke:local
+    profiles: [test]
+    read_only: true
+    tmpfs: ["/tmp:size=1g"]
+    environment:
+      GATEWAY_URL: http://gateway:8000
+      API_KEY: ${SMOKE_API_KEY:?set SMOKE_API_KEY in .env (make env)}
+      SERVICES: ${SMOKE_SERVICES:-claude,grok}
+      LARGE_UPLOAD_MIB: ${LARGE_UPLOAD_MIB:-64}
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+volumes:
+  postgres-data: {}

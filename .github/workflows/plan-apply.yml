@@ -1,0 +1,252 @@
+# Production for this repository: the shared platform (terraform/prod) and the gateway
+# (gateway/, deployed by gateway/deploy). Plan on pull requests; on merge to main, apply
+# the platform first, then deploy the gateway, so a change touching both lands in order
+# (the gateway reads what the platform publishes). Only what changed runs.
+#
+# The bootstrap stack is never applied by CI (make aws-bootstrap, by an administrator).
+# The zip services deploy from their own repositories.
+#
+# Needs repository variables AWS_ACCOUNT_ID, AWS_REGION and DOMAIN_NAME, the secret
+# SMOKE_API_KEY, and an environment named `prod` (add required reviewers there to gate
+# applies on approval).
+name: plan-apply
+
+on:
+  pull_request:
+    paths: &paths
+      - "terraform/prod/**"
+      - "terraform/modules/**"
+      - "gateway/**"
+      - "contract/**"
+      - ".github/workflows/plan-apply.yml"
+      - ".github/workflows/gateway.yml"
+  push:
+    branches: [main]
+    paths: *paths
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "What to apply: both, platform, or gateway (e.g. after make aws-down)"
+        type: choice
+        options: [both, platform, gateway]
+        default: both
+
+# One Terraform run at a time against prod; never cancel an apply half way.
+concurrency:
+  group: terraform-prod
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "1.16.3"
+  TF_IN_AUTOMATION: "1"
+  STACK: terraform/prod
+  GATEWAY_STACK: gateway/deploy
+
+jobs:
+  changes:
+    name: What changed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      platform: ${{ steps.diff.outputs.platform }}
+      gateway: ${{ steps.diff.outputs.gateway }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          TARGET: ${{ inputs.target }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ "$EVENT" = workflow_dispatch ]; then
+            platform=false; gateway=false
+            case "$TARGET" in both|platform) platform=true ;; esac
+            case "$TARGET" in both|gateway) gateway=true ;; esac
+          elif [ -z "$BASE" ] || [ "$BASE" = 0000000000000000000000000000000000000000 ] \
+               || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            platform=true; gateway=true # first push, or history rewritten: do both
+          else
+            files="$(git diff --name-only "$BASE...$HEAD")"
+            platform=false; gateway=false
+            grep -qE '^(terraform/(prod|modules)/|\.github/workflows/plan-apply\.yml)' <<<"$files" && platform=true
+            grep -qE '^(gateway/|contract/|terraform/modules/ecs-service/|\.github/workflows/(plan-apply|gateway)\.yml)' <<<"$files" && gateway=true
+          fi
+          echo "platform=$platform gateway=$gateway"
+          { echo "platform=$platform"; echo "gateway=$gateway"; } >> "$GITHUB_OUTPUT"
+
+  # ------------------------------------------------------------------ pull requests
+
+  plan:
+    name: Plan platform
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.platform == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/zip-platform-platform-plan
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - name: Init
+        run: >
+          terraform -chdir="$STACK" init -input=false
+          -backend-config="bucket=zip-platform-tfstate-${{ vars.AWS_ACCOUNT_ID }}-${{ vars.AWS_REGION }}"
+          -backend-config="region=${{ vars.AWS_REGION }}"
+      - name: Plan (read-only role, so no state lock)
+        run: |
+          terraform -chdir="$STACK" plan -input=false -lock=false -no-color | tee plan.txt
+          {
+            echo '### terraform/prod plan'
+            echo '```'
+            tail -c 60000 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  gateway-plan:
+    name: Plan gateway
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.gateway == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/zip-platform-gateway-plan
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - name: Plan (read-only role, so no state lock)
+        env:
+          TF_VAR_region: ${{ vars.AWS_REGION }}
+          TF_VAR_image_tag: ${{ github.event.pull_request.head.sha }}
+        run: |
+          terraform -chdir="$GATEWAY_STACK" init -input=false \
+            -backend-config="bucket=zip-platform-tfstate-${{ vars.AWS_ACCOUNT_ID }}-${{ vars.AWS_REGION }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
+          terraform -chdir="$GATEWAY_STACK" plan -input=false -lock=false -no-color | tee plan.txt
+          { echo "### gateway/deploy plan"; echo '```'; tail -c 60000 plan.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------ main
+
+  apply:
+    name: Apply platform
+    needs: changes
+    if: github.event_name != 'pull_request' && needs.changes.outputs.platform == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment:
+      name: prod
+      url: https://${{ vars.DOMAIN_NAME }}/docs
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/zip-platform-platform-deploy
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - name: Init
+        run: >
+          terraform -chdir="$STACK" init -input=false
+          -backend-config="bucket=zip-platform-tfstate-${{ vars.AWS_ACCOUNT_ID }}-${{ vars.AWS_REGION }}"
+          -backend-config="region=${{ vars.AWS_REGION }}"
+      - name: Apply
+        run: terraform -chdir="$STACK" apply -input=false -auto-approve
+
+  gateway-check:
+    name: Gateway checks
+    needs: changes
+    if: github.event_name != 'pull_request' && needs.changes.outputs.gateway == 'true'
+    uses: ./.github/workflows/gateway.yml
+
+  gateway-deploy:
+    name: Deploy gateway
+    needs: [changes, apply, gateway-check]
+    # After the platform apply when there was one; never after a failed one.
+    if: >
+      always() && github.event_name != 'pull_request' &&
+      needs.changes.outputs.gateway == 'true' &&
+      needs.gateway-check.result == 'success' &&
+      contains(fromJSON('["success", "skipped"]'), needs.apply.result)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment:
+      name: prod
+      url: https://${{ vars.DOMAIN_NAME }}/docs
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      SERVICE: gateway
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          # The gateway's own, narrow role (its ECR repository, state key and ECS service).
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/zip-platform-gateway-deploy
+          aws-region: ${{ vars.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push the image (tags are immutable; an existing tag is reused)
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/zip-platform/gateway:${{ github.sha }}
+          SHA: ${{ github.sha }}
+        run: |
+          if aws ecr describe-images --repository-name "zip-platform/$SERVICE" \
+               --image-ids imageTag="$SHA" >/dev/null 2>&1; then
+            echo "$IMAGE already pushed"
+          else
+            docker build --build-arg GIT_SHA="$SHA" -t "$IMAGE" gateway
+            docker push "$IMAGE"
+          fi
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - name: Apply (waits until the new task is healthy; rolls back if it never is)
+        env:
+          TF_VAR_region: ${{ vars.AWS_REGION }}
+          TF_VAR_image_tag: ${{ github.sha }}
+        run: |
+          terraform -chdir="$GATEWAY_STACK" init -input=false \
+            -backend-config="bucket=zip-platform-tfstate-${{ vars.AWS_ACCOUNT_ID }}-${{ vars.AWS_REGION }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
+          terraform -chdir="$GATEWAY_STACK" apply -input=false -auto-approve
+      - name: Post-deploy check through the load balancer
+        env:
+          BASE: https://${{ vars.DOMAIN_NAME }}
+          API_KEY: ${{ secrets.SMOKE_API_KEY }}
+        run: |
+          curl -fsS --retry 10 --retry-delay 6 --retry-all-errors "$BASE/health/ready"
+          echo
+          # Authentication is enforced, and the portal answers.
+          test "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/claude/health/ready")" = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/docs/login")" = 200
+          # Proxying works for a service that is up (a 502 here means it is not deployed).
+          curl -fsS -H "Authorization: Bearer $API_KEY" "$BASE/claude/health/ready" \
+            || echo "::warning::claude is not reachable through the gateway yet"
