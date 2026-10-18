@@ -14,7 +14,7 @@ cd "$ROOT"
 key="$(sed -n 's/^SMOKE_API_KEY=//p' .env)"
 [ -n "$key" ] || { echo "no SMOKE_API_KEY in .env (make env)" >&2; exit 1; }
 services="${SERVICES:-$(sed -n 's/^SMOKE_SERVICES=//p' .env)}"
-services="${services:-claude,grok}"
+services="${services:-claude,grok,dsh}"
 project="$(basename "$ROOT")"
 network="${COMPOSE_NETWORK:-${project}_default}"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"

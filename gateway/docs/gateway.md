@@ -14,7 +14,7 @@ Everything after the prefix is passed to the service unchanged, so
 
 ## Zip files in the browser
 
-Signed in, open [Zip files](/docs/zip): choose a service, drop or choose files, and the
+Signed in, open [Zip files](/zip): choose a service, drop or choose files, and the
 archive downloads under the service's default name as it is made. There is no size
 limit: the page streams the upload and the download at the same time.
 

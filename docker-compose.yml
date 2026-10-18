@@ -1,8 +1,10 @@
 # Local integration of the gateway and the zip services, the same topology as on AWS
-# (docs/deployment.md): one container per service, only the gateway reachable from the host.
+# (docs/deployment.md): one container per service, only the gateway reachable from the host,
+# plus fake-cognito in place of Amazon Cognito (on 127.0.0.1 only), so nothing needs the cloud.
 #
-#   make up        build and start everything (dsh too, once it has a Dockerfile: make up-dsh)
+#   make up        build and start everything
 #   make smoke     run the smoke tests for every service through the gateway
+#   make dev-admin EMAIL=you@example.com   an admin account (password in localhost:9229/outbox)
 #   make down      stop and remove the containers
 #
 # The service directories are only read, as Docker build contexts.
@@ -55,8 +57,6 @@ services:
       args:
         GIT_SHA: ${DSH_GIT_SHA:-unknown}
     image: zip-dsh:local
-    # Opt-in until the dsh service has a Dockerfile: `make up-dsh` or --profile dsh.
-    profiles: [dsh]
 
   gateway:
     <<: *hardened
@@ -74,26 +74,67 @@ services:
       GATEWAY_COOKIE_SECURE: "false"
       # Accounts data (user API keys): the local Postgres below. Migrations run at startup.
       GATEWAY_DATABASE_URL: postgresql+asyncpg://gateway:gateway@postgres:5432/gateway
-      # Sign-in with the dev Cognito pool and invite links: `make dev-auth` writes these
-      # into .env. Left empty, the portal offers API-key sign-in only.
-      GATEWAY_COGNITO_DOMAIN: ${GATEWAY_COGNITO_DOMAIN:-}
-      GATEWAY_COGNITO_CLIENT_ID: ${GATEWAY_COGNITO_CLIENT_ID:-}
-      GATEWAY_COGNITO_CLIENT_SECRET: ${GATEWAY_COGNITO_CLIENT_SECRET:-}
-      GATEWAY_COGNITO_USER_POOL_ID: ${GATEWAY_COGNITO_USER_POOL_ID:-}
-      GATEWAY_PUBLIC_URL: ${GATEWAY_PUBLIC_URL:-}
-      # An IAM user that can only manage users in the dev pool (terraform/dev).
-      AWS_ACCESS_KEY_ID: ${GATEWAY_DEV_AWS_ACCESS_KEY_ID:-}
-      AWS_SECRET_ACCESS_KEY: ${GATEWAY_DEV_AWS_SECRET_ACCESS_KEY:-}
+      # Sign-in and invite codes against the local fake-cognito (no cloud). The browser
+      # reaches its hosted login on localhost; the gateway calls it by compose name. These
+      # values are local-only, not secrets.
+      GATEWAY_COGNITO_DOMAIN: http://localhost:${FAKE_COGNITO_PORT:-9229}
+      GATEWAY_COGNITO_BACKCHANNEL_URL: http://fake-cognito:9229
+      GATEWAY_COGNITO_CLIENT_ID: local-gateway
+      GATEWAY_COGNITO_CLIENT_SECRET: local-gateway-secret
+      GATEWAY_COGNITO_USER_POOL_ID: eu-west-2_LocalDev1
+      GATEWAY_PUBLIC_URL: http://localhost:${GATEWAY_PORT:-8080}
+      # boto3 needs credentials to sign with; fake-cognito does not check them.
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+    # Only what the gateway itself needs. The zip services start alongside it: one that
+    # is broken answers 502 through the gateway instead of stopping the whole stack
+    # (`make up` reports it).
     depends_on:
+      fake-cognito:
+        condition: service_healthy
       postgres:
         condition: service_healthy
-      claude:
-        condition: service_healthy
-      grok:
-        condition: service_healthy
-      dsh:
-        condition: service_healthy
-        required: false
+
+  # A local stand-in for Amazon Cognito (fake-cognito/app.py): hosted sign-in, tokens,
+  # the admin API, and an outbox for the emails Cognito would send
+  # (http://localhost:9229/outbox). Development only. Accounts live in the named volume.
+  fake-cognito:
+    <<: *hardened
+    build:
+      context: ./fake-cognito
+      target: runtime
+    image: zip-fake-cognito:local
+    ports:
+      - "127.0.0.1:${FAKE_COGNITO_PORT:-9229}:9229"
+    environment:
+      FAKE_COGNITO_DEV_ONLY: "yes"
+      FAKE_COGNITO_POOL_ID: eu-west-2_LocalDev1
+      FAKE_COGNITO_CLIENT_ID: local-gateway
+      FAKE_COGNITO_CLIENT_SECRET: local-gateway-secret
+      FAKE_COGNITO_CALLBACK_URLS: http://localhost:${GATEWAY_PORT:-8080}/account/auth/callback
+      FAKE_COGNITO_LOGOUT_URLS: http://localhost:${GATEWAY_PORT:-8080}/account/login
+      FAKE_COGNITO_LOGIN_URL: http://localhost:${GATEWAY_PORT:-8080}/account/login
+    volumes:
+      - fake-cognito-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "__import__('urllib.request').request.urlopen('http://127.0.0.1:9229/health',timeout=2)"
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  # The AWS CLI against fake-cognito, for make dev-admin (the same calls as against AWS).
+  aws-cli:
+    image: amazon/aws-cli:2.37.0
+    profiles: [tools]
+    environment:
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_DEFAULT_REGION: eu-west-2
+    entrypoint: ["aws", "--endpoint-url", "http://fake-cognito:9229"]
 
   # Postgres for the gateway's accounts data (Aurora PostgreSQL on AWS). The data lives in
   # the named volume: `make down` keeps it, `docker compose down -v` deletes it.
@@ -121,11 +162,17 @@ services:
     environment:
       GATEWAY_URL: http://gateway:8000
       API_KEY: ${SMOKE_API_KEY:?set SMOKE_API_KEY in .env (make env)}
-      SERVICES: ${SMOKE_SERVICES:-claude,grok}
+      SERVICES: ${SMOKE_SERVICES:-claude,grok,dsh}
       LARGE_UPLOAD_MIB: ${LARGE_UPLOAD_MIB:-64}
+      # The account flow test (test_accounts.py): sign-in through fake-cognito. The URLs
+      # the browser would use, mapped to compose names by the test.
+      FAKE_COGNITO_URL: http://fake-cognito:9229
+      PUBLIC_GATEWAY_URL: http://localhost:${GATEWAY_PORT:-8080}
+      PUBLIC_COGNITO_URL: http://localhost:${FAKE_COGNITO_PORT:-9229}
     depends_on:
       gateway:
         condition: service_healthy
 
 volumes:
   postgres-data: {}
+  fake-cognito-data: {}

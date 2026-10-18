@@ -9,5 +9,5 @@ RUN useradd --uid 10001 --create-home smoke
 ENV PYTHONDONTWRITEBYTECODE=1
 USER 10001
 WORKDIR /smoke
-COPY test_smoke.py ./
-ENTRYPOINT ["python", "-m", "pytest", "-ra", "-p", "no:cacheprovider", "test_smoke.py"]
+COPY test_smoke.py test_accounts.py ./
+ENTRYPOINT ["python", "-m", "pytest", "-ra", "-p", "no:cacheprovider", "test_smoke.py", "test_accounts.py"]

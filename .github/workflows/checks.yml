@@ -41,3 +41,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: make test-lambda
+
+  fake-cognito:
+    name: fake-cognito contract tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - run: make fake-cognito-test

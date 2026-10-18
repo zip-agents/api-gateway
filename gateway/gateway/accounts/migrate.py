@@ -16,6 +16,8 @@ from alembic.config import Config
 from sqlalchemy import Connection, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from gateway.accounts.connect import begin
+
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 _LOCK_ID = 7_402_771  # arbitrary, fixed: "the gateway's migrations"
 
@@ -28,7 +30,7 @@ def _upgrade(connection: Connection) -> None:
 
 
 async def migrate(engine: AsyncEngine) -> None:
-    async with engine.begin() as connection:
+    async with begin(engine) as connection:
         if connection.dialect.name == "postgresql":
             await connection.execute(text("SELECT pg_advisory_xact_lock(:id)"), {"id": _LOCK_ID})
         await connection.run_sync(_upgrade)

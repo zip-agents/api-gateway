@@ -319,3 +319,27 @@ def test_headers_named_in_connection_are_not_forwarded() -> None:
     names = {name for name, _ in headers}
     assert b"x-secret" not in names
     assert b"connection" not in names
+
+
+async def test_a_service_cannot_set_cookies_on_the_gateway_origin() -> None:
+    async def handler(conn: ServerConn) -> None:
+        await conn.read_request()
+        await conn.read_body()
+        await conn.respond(
+            200,
+            [
+                ("Content-Type", "application/zip"),
+                ("Set-Cookie", "gw_docs_session=forged; Path=/"),
+                ("Content-Disposition", 'attachment; filename="a.zip"'),
+            ],
+        )
+        await conn.end()
+
+    async with FakeUpstream(handler) as fake:
+        client = AsgiClient("POST", "/claude/api/v1/zip", [AUTH, ("Content-Length", "0")])
+        await run(proxy_for(fake.upstream), client, fake.upstream)
+
+    assert client.status == 200
+    assert "set-cookie" not in client.headers
+    # The API path otherwise passes the service's headers through untouched.
+    assert client.headers["content-disposition"] == 'attachment; filename="a.zip"'

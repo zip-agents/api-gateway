@@ -40,6 +40,9 @@ users = Table(
     Column("last_login", DateTime(timezone=True)),
     Column("login_count", BigInteger, nullable=False, server_default="0"),
     Column("disabled", DateTime(timezone=True)),  # set by an admin; signs the user out
+    # Sessions issued before this are refused (set when the user signs out: a copied
+    # session cookie dies with the one signed out).
+    Column("sessions_valid_after", DateTime(timezone=True)),
 )
 
 invites = Table(

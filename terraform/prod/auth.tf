@@ -8,9 +8,9 @@ module "auth" {
 
   name          = local.name
   domain_prefix = "${local.name}-${data.aws_caller_identity.current.account_id}"
-  login_url     = "https://${var.domain_name}/docs/login"
-  callback_urls = ["https://${var.domain_name}/docs/auth/callback"]
-  logout_urls   = ["https://${var.domain_name}/docs/login"]
+  login_url     = "https://${var.domain_name}/account/login"
+  callback_urls = ["https://${var.domain_name}/account/auth/callback"]
+  logout_urls   = ["https://${var.domain_name}/account/login"]
 }
 
 # The app client's secret, for the gateway (GATEWAY_COGNITO_CLIENT_SECRET). Unlike the API

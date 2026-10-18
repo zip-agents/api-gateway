@@ -1,5 +1,6 @@
 # The gateway's accounts database: Aurora PostgreSQL Serverless v2, scaling to 0 ACU and
-# pausing when idle (about $1/month for storage; ~15 s to resume on the first query).
+# pausing ~15 min after the last query (about $1/month for storage). The first query
+# after that waits for it to resume: ~15 s, 30 s or more after a day paused.
 # Reachable from the gateway tasks only. Destroyed with this stack, data included.
 #
 # The password never enters Terraform state: it is an ephemeral value, written once to
@@ -63,7 +64,7 @@ resource "aws_rds_cluster" "accounts" {
   serverlessv2_scaling_configuration {
     min_capacity             = 0 # pause when idle
     max_capacity             = 2
-    seconds_until_auto_pause = 600
+    seconds_until_auto_pause = 600 # the gateway closes idle connections after 300 s (store.py)
   }
 
   backup_retention_period = 1

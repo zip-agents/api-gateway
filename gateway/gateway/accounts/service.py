@@ -29,12 +29,16 @@ class Accounts:
         directory: Directory | None = None
         if settings.cognito is not None:
             oidc = CognitoOidc(settings.cognito)
-            directory = CognitoDirectory(settings.cognito.user_pool_id, settings.cognito.region)
+            directory = CognitoDirectory(
+                settings.cognito.user_pool_id,
+                settings.cognito.region,
+                settings.cognito.backchannel_url,
+            )
         return cls(
             store=store,
             keys=KeyService(store),
             invites=InviteService(store, directory),
-            users=UserGate(store),
+            users=UserGate(store, directory),
             quota=QuotaService(store, settings.user_daily_quota_bytes),
             flow=FlowCookie(settings.session_secret),
             oidc=oidc,

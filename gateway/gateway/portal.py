@@ -1,22 +1,26 @@
-"""The gateway's own routes: health checks and the authenticated docs portal.
+"""The gateway's own routes: health checks, the portal, and its documentation.
 
     GET  /health/live, /health/ready          unauthenticated, for the load balancer
-    GET  /docs                                portal home: services, status, versions
-    GET  /docs/api                            interactive reference (Scalar) for the contract
+    GET  /                                   home: services, status, versions
+    GET  /zip                                upload page (+ /zip/jobs/..., browser_jobs.py)
+    GET  /account/login, POST /account/login  sign-in page; sign-in with an API key
+    GET  /account/auth/start, /account/auth/callback  sign-in with Cognito (accounts/oidc.py)
+    POST /account/logout
+    GET|POST /account/join                   public: redeem an invite code (choose email, password)
+    GET  /account/keys                       the user's own API keys
+    GET  /account/admin/{invites,users,keys}  admin pages (Cognito group "admin")
+    GET  /docs                               documentation index
+    GET  /docs/api                           interactive reference (Scalar) for the contract
     GET  /docs/api/<service>[?source=contract] a service's own document, or the contract
-    GET  /docs/openapi/...json                those documents, prepared for the gateway
-    GET  /docs/openapi.yaml                   the contract's document, as written
-    GET  /docs/compare                        each service's document against the contract
-    GET  /docs/pages/<slug>                   the gateway's pages (contract, usage)
-    GET  /docs/services/<service>/<slug>      a service's own docs (contract §14)
-    GET  /docs/zip, /docs/keys                upload page; the user's own API keys
-    GET  /docs/login, POST /docs/login        sign-in page; sign-in with an API key
-    GET  /docs/auth/start, /docs/auth/callback  sign-in with Cognito (accounts/oidc.py)
-    POST /docs/logout
-    GET|POST /docs/invite/<token>             public: redeem an invite link
-    GET  /docs/admin/{invites,users,keys}     admin pages (Cognito group "admin")
+    GET  /docs/openapi/...json               those documents, prepared for the gateway
+    GET  /docs/openapi.yaml                  the contract's document, as written
+    GET  /docs/compare                       each service's document against the contract
+    GET  /docs/pages/<slug>                  the gateway's pages (contract, usage)
+    GET  /docs/services/<service>/<slug>     a service's own docs (contract §14)
+    GET  /static/<name>                      the portal's CSS and scripts
 
-Docs pages need the session cookie (see auth.py); the browser is sent to the login page
+`/docs` holds documentation only. Every page except health, sign-in and joining with an invite code
+needs the session cookie (see auth.py); the browser is sent to the login page
 otherwise. Pages are server-rendered with no inline script, so a strict CSP applies to all
 of them except the API reference, which loads Scalar from a pinned, SRI-checked URL.
 
@@ -34,6 +38,7 @@ import re
 import time
 from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import parse_qs, quote
 
@@ -52,7 +57,7 @@ from starlette.routing import Route
 
 from gateway.accounts import pages
 from gateway.accounts.directory import DirectoryError
-from gateway.accounts.invites import InvalidInvite, Redeemed, valid_email
+from gateway.accounts.invites import InvalidInvite, Redeemed, password_problem, valid_email
 from gateway.accounts.keys import InvalidKeyName, TooManyKeys, utc_now
 from gateway.accounts.oidc import FLOW_COOKIE, FLOW_PATH, FLOW_SECONDS, OidcError
 from gateway.accounts.quota import human_bytes
@@ -80,9 +85,12 @@ _STRICT_CSP = (
     "frame-ancestors 'none'; base-uri 'none'"
 )
 # Scalar injects inline styles. `connect-src 'self'` keeps "try it" requests, and the API
-# key typed into them, on this origin: no third-party request proxy can be used.
+# key typed into them, on this origin: no third-party request proxy can be used. Scripts:
+# this release's own directory on the CDN only, not all of jsdelivr (which serves anyone's
+# npm and GitHub files, so allowing the host would let injected markup load any script).
+SCALAR_SCRIPT_SOURCE = SCALAR_URL.rsplit("/dist/", 1)[0] + "/"
 _SCALAR_CSP = (
-    "default-src 'none'; script-src 'self' https://cdn.jsdelivr.net; "
+    f"default-src 'none'; script-src 'self' {SCALAR_SCRIPT_SOURCE}; "
     "style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; "
     "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
 )
@@ -96,9 +104,11 @@ _ZIP_CSP = (
 _SECURITY_HEADERS = {
     "Cache-Control": "no-store",
     "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
+    # Not "no-referrer": with it, browsers send `Origin: null` on form posts, which the
+    # same-origin check then refuses. "same-origin" still sends nothing to other sites.
+    "Referrer-Policy": "same-origin",
 }
-_NEXT = re.compile(r"^/docs(/[A-Za-z0-9._/-]*)?$")
+_NEXT = re.compile(r"^/((docs|zip|account/keys|account/admin)(/[A-Za-z0-9._/-]*)?)?$")
 _MAX_LOGIN_BODY = 4096
 # Unauthenticated form posts (key sign-in, invite redemption) per client IP address.
 _FORM_POSTS_PER_MINUTE = 10
@@ -107,7 +117,7 @@ _STATUS_TIMEOUT_SECONDS = 2.0
 
 def _safe_next(value: str | None) -> str:
     """Only redirect within the portal after sign-in (no open redirect)."""
-    return value if value and _NEXT.fullmatch(value) else "/docs"
+    return value if value and _NEXT.fullmatch(value) else "/"
 
 
 def create_portal(
@@ -139,9 +149,10 @@ def create_portal(
         """The signed-in session and its token, or None (also for a disabled user)."""
         token = request.cookies.get(SESSION_COOKIE)
         session = sessions.verify(token)
-        if session is None or token is None or not await accounts.users.allowed(session):
+        if session is None or token is None:
             return None
-        return session, token
+        live = await accounts.users.check(session)  # disabled, signed out, admin changed
+        return None if live is None else (live, token)
 
     async def current_admin(request: Request) -> tuple[Session, str] | Response:
         me = await current(request)
@@ -152,7 +163,7 @@ def create_portal(
         return me
 
     def login_redirect(request: Request) -> Response:
-        return RedirectResponse(f"/docs/login?next={quote(request.url.path)}", status_code=303)
+        return RedirectResponse(f"/account/login?next={quote(request.url.path)}", status_code=303)
 
     def html_page(
         title: str, body: str, nav: str = "", *, status: int = 200, csp: str = _STRICT_CSP
@@ -216,13 +227,10 @@ def create_portal(
     async def ready(request: Request) -> Response:
         return JSONResponse({"status": "ready"})
 
-    async def root(request: Request) -> Response:
-        return RedirectResponse("/docs", status_code=307)
-
     # ------------------------------------------------------------------ signing in and out
 
     async def login_form(request: Request) -> Response:
-        return login_page(request.query_params.get("next", "/docs"))
+        return login_page(request.query_params.get("next", "/"))
 
     async def login(request: Request) -> Response:
         """Sign in with an operator API key (GATEWAY_ALLOW_KEY_LOGIN)."""
@@ -230,9 +238,11 @@ def create_portal(
             raise HTTPException(404)
         if (limited := too_many(request)) is not None:
             return limited
+        if not same_origin(request.headers, request.url.scheme):
+            raise HTTPException(403)  # no signing a visitor in from another site
         form = await _read_form(request, _MAX_LOGIN_BODY)
         if form is None:
-            return login_page("/docs", "Request too large.", status=413)
+            return login_page("/", "Request too large.", status=413)
         target = _safe_next(form.get("next"))
         key_name = keyring.identify(form.get("api_key", "").strip())
         if key_name is None:
@@ -245,7 +255,7 @@ def create_portal(
         if oidc is None or settings.public_url is None:
             raise HTTPException(404)
         flow, cookie = accounts.flow.new(_safe_next(request.query_params.get("next")))
-        redirect_uri = f"{settings.public_url}/docs/auth/callback"
+        redirect_uri = f"{settings.public_url}/account/auth/callback"
         response = RedirectResponse(oidc.authorize_url(flow, redirect_uri), status_code=303)
         response.set_cookie(
             FLOW_COOKIE,
@@ -265,11 +275,11 @@ def create_portal(
         flow = accounts.flow.read(request.cookies.get(FLOW_COOKIE))
         state = params.get("state", "")
         if flow is None or not hmac.compare_digest(state.encode(), flow.state.encode()):
-            return login_page("/docs", "That sign-in expired. Please try again.", status=400)
+            return login_page("/", "That sign-in expired. Please try again.", status=400)
         if params.get("error") or not params.get("code"):
             # e.g. the user cancelled on Cognito's page
             return login_page(flow.next, "Sign-in was not completed.", status=400)
-        redirect_uri = f"{settings.public_url}/docs/auth/callback"
+        redirect_uri = f"{settings.public_url}/account/auth/callback"
         try:
             identity = await oidc.sign_in(params["code"], flow, redirect_uri)
         except OidcError as exc:
@@ -277,7 +287,7 @@ def create_portal(
             return login_page(flow.next, str(exc), status=400)
         existing = await accounts.store.get_user(identity.sub)
         if existing is not None and not existing.active:
-            return login_page("/docs", "This account has been disabled.", status=403)
+            return login_page("/", "This account has been disabled.", status=403)
         await accounts.store.record_login(
             identity.sub,
             identity.email,
@@ -293,61 +303,71 @@ def create_portal(
         return response
 
     async def logout(request: Request) -> Response:
+        if not same_origin(request.headers, request.url.scheme):
+            raise HTTPException(403)  # no forced sign-out from another site
         session = sessions.verify(request.cookies.get(SESSION_COOKIE))
-        target = "/docs/login"
+        if session is not None and session.user_sub:
+            # End every copy of this session, not just the browser's: a copied cookie
+            # would otherwise stay valid until it expires.
+            await accounts.store.end_sessions(session.user_sub, datetime.now(UTC))
+            accounts.users.forget(session.user_sub)
+        target = "/account/login"
         if session is not None and session.user_sub and oidc and settings.public_url:
             # Also end Cognito's own session, or "Sign in" would skip its login form.
-            target = oidc.logout_url(f"{settings.public_url}/docs/login")
+            target = oidc.logout_url(f"{settings.public_url}/account/login")
         response = RedirectResponse(target, status_code=303)
         response.delete_cookie(SESSION_COOKIE, path=SESSION_PATH)
         return response
 
-    # ------------------------------------------------------------------ invite links (public)
+    # ------------------------------------------------------------------ joining (public)
 
-    async def invite(request: Request) -> Response:
-        token = request.path_params["token"]
-        gone = (
-            "Invite not valid",
-            "This invite link has been used, has expired, or was withdrawn. Ask whoever "
-            "sent it for a new one.",
-        )
+    async def join(request: Request) -> Response:
+        """Redeem an invite code: the person chooses their email and password here."""
         if not accounts.invites.enabled:
             return message_page(
                 "Sign-up unavailable", "Accounts cannot be created here.", status=404
             )
         if request.method == "GET":
-            if not await accounts.invites.is_open(token):
-                return message_page(*gone, status=410)
-            return html_page("Create your account", pages.invite_form(token))
+            code = request.query_params.get("code", "")[:20]
+            return html_page("Create your account", pages.join_form(code))
         if (limited := too_many(request)) is not None:
             return limited
         form = await _read_form(request)
         if form is None or not same_origin(request.headers, request.url.scheme):
             raise HTTPException(403)
+        code = form.get("code", "").strip()[:20]
         email = form.get("email", "").strip().lower()
+        password = form.get("password", "")
+
+        def again(error: str, status: int) -> Response:
+            # The code and email are kept; passwords never go back into a page.
+            body = pages.join_form(code, email, error)
+            return html_page("Create your account", body, status=status)
+
         if not valid_email(email):
-            body = pages.invite_form(token, "Enter a valid email address.")
-            return html_page("Create your account", body, status=422)
-        outcome = await accounts.invites.redeem(token, email)
+            return again("Enter a valid email address.", 422)
+        if password != form.get("confirm", ""):
+            return again("The two passwords do not match.", 422)
+        if (problem := password_problem(password)) is not None:
+            return again(f"Choose another password: {problem}", 422)
+        outcome = await accounts.invites.redeem(code, email, password)
         if outcome is Redeemed.CREATED:
             return message_page(
-                "Check your email",
-                f"Your account has been created. A temporary password is on its way to "
-                f"{email}; sign in with it and choose your own password.",
-                link=("/docs/login", "Sign in"),
+                "Your account is ready",
+                f"Sign in as {email} with the password you just chose.",
+                link=("/account/auth/start?next=/", "Sign in"),
+            )
+        if outcome is Redeemed.INVALID:
+            return again(
+                "That code is not valid: it may have been used, have expired or been "
+                "withdrawn. Check it, or ask whoever gave it to you for a new one.",
+                410,
             )
         if outcome is Redeemed.EXISTS:
-            body = pages.invite_form(
-                token, "That email already has an account: sign in instead, or use another."
-            )
-            return html_page("Create your account", body, status=409)
-        if outcome is Redeemed.INVALID:
-            return message_page(*gone, status=410)
-        return message_page(
-            "Try again later",
-            "Your account could not be created just now. The link still works.",
-            status=503,
-        )
+            return again("That email already has an account: sign in instead, or use another.", 409)
+        if outcome is Redeemed.BAD_PASSWORD:
+            return again("That password was not accepted: choose another.", 422)
+        return again("Your account could not be created just now. The code still works.", 503)
 
     # ------------------------------------------------------------------ docs pages
 
@@ -362,6 +382,14 @@ def create_portal(
         )
         body = _home_body(session.label, upstreams, statuses, all_docs)
         return html_page("Zip services", body, await nav_for(session, all_docs))
+
+    async def docs_index(request: Request) -> Response:
+        me = await current(request)
+        if me is None:
+            return login_redirect(request)
+        all_docs = await service_docs.get_all()
+        body = _docs_index_body(docs, all_docs)
+        return html_page("Documentation", body, await nav_for(me[0], all_docs))
 
     async def api_reference(request: Request) -> Response:
         if await current(request) is None:
@@ -382,24 +410,24 @@ def create_portal(
             '<!doctype html><html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
             f"<title>{html.escape(title)} - zip gateway</title>"
-            '<link rel="stylesheet" href="/docs/static/api-bar.css"></head><body>'
+            '<link rel="stylesheet" href="/static/api-bar.css"></head><body>'
             # api-reference.js reads the document URL from this attribute (no inline script).
             f'{bar}<div id="api-reference" data-spec="{html.escape(spec_url)}"></div>'
             f'<script src="{SCALAR_URL}" integrity="{SCALAR_SRI}" crossorigin="anonymous">'
-            '</script><script src="/docs/static/api-reference.js"></script></body></html>',
+            '</script><script src="/static/api-reference.js"></script></body></html>',
             headers={**_SECURITY_HEADERS, "Content-Security-Policy": _SCALAR_CSP},
         )
 
     async def openapi(request: Request) -> Response:
         if await current(request) is None:
-            return PlainTextResponse("Sign in at /docs/login", status_code=401)
+            return PlainTextResponse("Sign in at /account/login", status_code=401)
         return FileResponse(
             docs.openapi_path, media_type="application/yaml", headers=_SECURITY_HEADERS
         )
 
     async def contract_spec(request: Request) -> Response:
         if await current(request) is None:
-            return PlainTextResponse("Sign in at /docs/login", status_code=401)
+            return PlainTextResponse("Sign in at /account/login", status_code=401)
         base = _base_url(request)
         servers = [
             (f"{base}/{name}", f"{name}, through the gateway") for name in settings.upstreams
@@ -413,7 +441,7 @@ def create_portal(
 
     async def service_spec(request: Request) -> Response:
         if await current(request) is None:
-            return PlainTextResponse("Sign in at /docs/login", status_code=401)
+            return PlainTextResponse("Sign in at /account/login", status_code=401)
         service, source = request.path_params["service"], request.path_params["source"]
         if service not in settings.upstreams or source not in ("service", "contract"):
             raise HTTPException(404)
@@ -512,7 +540,7 @@ def create_portal(
             raise HTTPException(403)
         if not await keys.revoke(request.path_params["prefix"], session.owner):
             raise HTTPException(404)
-        return RedirectResponse("/docs/keys", status_code=303)
+        return RedirectResponse("/account/keys", status_code=303)
 
     # ------------------------------------------------------------------ admin
 
@@ -521,7 +549,7 @@ def create_portal(
         if isinstance(me, Response):
             return me
         session, token = me
-        new_link, error, status = None, None, 200
+        new_code, error, status = None, None, 200
         if request.method == "POST":
             form = await _read_form(request)
             if not form_allowed(request, form, token):
@@ -530,14 +558,15 @@ def create_portal(
             try:
                 days = int(form.get("days", "7"))
                 created = await accounts.invites.create(form.get("label", ""), days, session.label)
-                new_link = f"{public_base(request)}/docs/invite/{created.token}"
+                new_code = created.code
             except ValueError as exc:  # InvalidInvite, or days not a number
                 error = str(exc) if isinstance(exc, InvalidInvite) else "Enter a number of days."
                 status = 422
         body = pages.admin_invites_body(
             await accounts.invites.list_invites(),
             sessions.csrf_token(token),
-            new_link=new_link,
+            new_code=new_code,
+            join_url=f"{public_base(request)}/account/join",
             error=error,
             enabled=accounts.invites.enabled,
             now=utc_now(),
@@ -552,7 +581,7 @@ def create_portal(
             raise HTTPException(403)
         if not await accounts.invites.revoke(request.path_params["invite_id"]):
             raise HTTPException(404)
-        return RedirectResponse("/docs/admin/invites", status_code=303)
+        return RedirectResponse("/account/admin/invites", status_code=303)
 
     async def users_page(session: Session, token: str, error: str | None, status: int) -> Response:
         users, labels, logins = await asyncio.gather(
@@ -598,7 +627,7 @@ def create_portal(
                 return await users_page(session, token, error, 502)
         await accounts.store.disable_user(sub, utc_now())  # also revokes their keys
         accounts.users.forget(sub)
-        return RedirectResponse("/docs/admin/users", status_code=303)
+        return RedirectResponse("/account/admin/users", status_code=303)
 
     async def admin_keys(request: Request) -> Response:
         me = await current_admin(request)
@@ -616,7 +645,7 @@ def create_portal(
             raise HTTPException(403)
         if not await keys.revoke(request.path_params["prefix"]):
             raise HTTPException(404)
-        return RedirectResponse("/docs/admin/keys", status_code=303)
+        return RedirectResponse("/account/admin/keys", status_code=303)
 
     # ------------------------------------------------------------------ the rest
 
@@ -638,37 +667,39 @@ def create_portal(
 
     return Starlette(
         routes=[
-            Route("/", root),
+            Route("/", home),
             Route("/health/live", live),
             Route("/health/ready", ready),
-            Route("/docs", home),
+            Route("/docs", docs_index),
             Route("/docs/api", api_reference),
             Route("/docs/api/{service}", api_reference),
             Route("/docs/openapi.yaml", openapi),
             Route("/docs/openapi/contract.json", contract_spec),
             Route("/docs/openapi/{service}/{source}.json", service_spec),
             Route("/docs/compare", compare_page),
-            Route("/docs/zip", zip_page),
-            Route("/docs/keys", keys_page, methods=["GET", "POST"]),
-            Route("/docs/keys/{prefix}/revoke", revoke_key, methods=["POST"]),
-            Route("/docs/zip/jobs", AsgiEndpoint(jobs.create), methods=["POST"]),
-            Route("/docs/zip/jobs/{job_id}/archive", AsgiEndpoint(jobs.download), methods=["GET"]),
-            Route("/docs/zip/jobs/{job_id}/files", AsgiEndpoint(jobs.upload), methods=["POST"]),
+            Route("/zip", zip_page),
+            Route("/account/keys", keys_page, methods=["GET", "POST"]),
+            Route("/account/keys/{prefix}/revoke", revoke_key, methods=["POST"]),
+            Route("/zip/jobs", AsgiEndpoint(jobs.create), methods=["POST"]),
+            Route("/zip/jobs/{job_id}/archive", AsgiEndpoint(jobs.download), methods=["GET"]),
+            Route("/zip/jobs/{job_id}/files", AsgiEndpoint(jobs.upload), methods=["POST"]),
             Route("/docs/pages/{slug}", gateway_page),
             Route("/docs/services/{service}/{slug}", service_page),
-            Route("/docs/login", login_form, methods=["GET"]),
-            Route("/docs/login", login, methods=["POST"]),
-            Route("/docs/auth/start", auth_start, methods=["GET"]),
-            Route("/docs/auth/callback", auth_callback, methods=["GET"]),
-            Route("/docs/logout", logout, methods=["POST"]),
-            Route("/docs/invite/{token}", invite, methods=["GET", "POST"]),
-            Route("/docs/admin/invites", admin_invites, methods=["GET", "POST"]),
-            Route("/docs/admin/invites/{invite_id}/revoke", admin_revoke_invite, methods=["POST"]),
-            Route("/docs/admin/users", admin_users, methods=["GET"]),
-            Route("/docs/admin/users/{sub}/disable", admin_disable_user, methods=["POST"]),
-            Route("/docs/admin/keys", admin_keys, methods=["GET"]),
-            Route("/docs/admin/keys/{prefix}/revoke", admin_revoke_key, methods=["POST"]),
-            Route("/docs/static/{name}", static),
+            Route("/account/login", login_form, methods=["GET"]),
+            Route("/account/login", login, methods=["POST"]),
+            Route("/account/auth/start", auth_start, methods=["GET"]),
+            Route("/account/auth/callback", auth_callback, methods=["GET"]),
+            Route("/account/logout", logout, methods=["POST"]),
+            Route("/account/join", join, methods=["GET", "POST"]),
+            Route("/account/admin/invites", admin_invites, methods=["GET", "POST"]),
+            Route(
+                "/account/admin/invites/{invite_id}/revoke", admin_revoke_invite, methods=["POST"]
+            ),
+            Route("/account/admin/users", admin_users, methods=["GET"]),
+            Route("/account/admin/users/{sub}/disable", admin_disable_user, methods=["POST"]),
+            Route("/account/admin/keys", admin_keys, methods=["GET"]),
+            Route("/account/admin/keys/{prefix}/revoke", admin_revoke_key, methods=["POST"]),
+            Route("/static/{name}", static),
         ],
         exception_handlers={HTTPException: http_error, Exception: internal_error},
         lifespan=lifespan,
@@ -781,14 +812,17 @@ def _nav(docs: DocsSite, all_docs: Sequence[ServiceDocs], *, admin: bool = False
     sections: list[tuple[str, list[tuple[str, str]]]] = [
         (
             "Gateway",
+            [("/", "Home"), ("/zip", "Zip files"), ("/account/keys", "My API keys")],
+        ),
+        (
+            "Docs",
             [
-                ("/docs/zip", "Zip files"),
-                ("/docs/keys", "My API keys"),
+                ("/docs", "Documentation"),
                 ("/docs/api", "API reference (all)"),
                 ("/docs/compare", "Compare specs"),
             ]
             + [(f"/docs/pages/{p.slug}", p.title) for p in docs.pages.values()],
-        )
+        ),
     ]
     for service_docs in all_docs:
         links = [(f"/docs/api/{service_docs.service}", "API reference")] + [
@@ -797,7 +831,7 @@ def _nav(docs: DocsSite, all_docs: Sequence[ServiceDocs], *, admin: bool = False
         ]
         sections.append((service_docs.service, links))
     parts = []
-    for (heading, links), section_docs in zip(sections, [None, *all_docs], strict=True):
+    for (heading, links), section_docs in zip(sections, [None, None, *all_docs], strict=True):
         items = "".join(
             f'<li><a href="{html.escape(href)}">{html.escape(title)}</a></li>'
             for href, title in links
@@ -808,18 +842,48 @@ def _nav(docs: DocsSite, all_docs: Sequence[ServiceDocs], *, admin: bool = False
     if admin:
         parts.append(
             "<h3>Admin</h3><ul>"
-            '<li><a href="/docs/admin/invites">Invites</a></li>'
-            '<li><a href="/docs/admin/users">Users</a></li>'
-            '<li><a href="/docs/admin/keys">API keys</a></li></ul>'
+            '<li><a href="/account/admin/invites">Invites</a></li>'
+            '<li><a href="/account/admin/users">Users</a></li>'
+            '<li><a href="/account/admin/keys">API keys</a></li></ul>'
         )
+    return "".join(parts)
+
+
+def _docs_index_body(docs: DocsSite, all_docs: Sequence[ServiceDocs]) -> str:
+    """/docs: every document, in one place."""
+
+    def items(links: Sequence[tuple[str, str, str]]) -> str:
+        return "".join(
+            f'<li><a href="{html.escape(href)}">{html.escape(title)}</a>'
+            f"{f' <span class="muted">{html.escape(note)}</span>' if note else ''}</li>"
+            for href, title, note in links
+        )
+
+    gateway = [
+        ("/docs/api", "API reference", "the contract, with every service as a server"),
+        ("/docs/compare", "Compare specs", "where each service's document differs from it"),
+        *[(f"/docs/pages/{p.slug}", p.title, "") for p in docs.pages.values()],
+    ]
+    parts = ["<h1>Documentation</h1>", "<h2>The API</h2>", f"<ul>{items(gateway)}</ul>"]
+    for service_docs in all_docs:
+        name = service_docs.service
+        links = [(f"/docs/api/{name}", "API reference", _build_label(service_docs).strip(" ()"))]
+        links += [
+            (f"/docs/services/{name}/{d.slug}", d.title, "")
+            for d in service_docs.documents.values()
+        ]
+        unavailable = (
+            "" if service_docs.available else '<p class="muted">Its own docs are unavailable.</p>'
+        )
+        parts.append(f"<h2>{html.escape(name)}</h2><ul>{items(links)}</ul>{unavailable}")
     return "".join(parts)
 
 
 def _layout(title: str, body: str, nav: str) -> str:
     header = (
-        '<header><a class="brand" href="/docs">zip gateway</a>'
-        '<a href="/docs/zip">Zip files</a><a href="/docs/api">API reference</a>'
-        '<form method="post" action="/docs/logout"><button>Sign out</button></form></header>'
+        '<header><a class="brand" href="/">zip gateway</a>'
+        '<a href="/zip">Zip files</a><a href="/docs">Docs</a>'
+        '<form method="post" action="/account/logout"><button>Sign out</button></form></header>'
         if nav
         else '<header><span class="brand">zip gateway</span></header>'
     )
@@ -827,7 +891,7 @@ def _layout(title: str, body: str, nav: str) -> str:
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         f"<title>{html.escape(title)} - zip gateway</title>"
-        '<link rel="stylesheet" href="/docs/static/portal.css"></head><body>'
+        '<link rel="stylesheet" href="/static/portal.css"></head><body>'
         f'{header}<div class="layout"><nav>{nav}</nav><main>{body}</main></div></body></html>'
     )
 
@@ -867,7 +931,7 @@ def _home_body(
         )
     return (
         f"<h1>Zip services</h1><p>Signed in as <strong>{html.escape(user)}</strong>.</p>"
-        '<p class="cta"><a class="button" href="/docs/zip">Zip files in the browser</a></p>'
+        '<p class="cta"><a class="button" href="/zip">Zip files in the browser</a></p>'
         '<p>Every service implements the same <a href="/docs/pages/contract">API contract</a>'
         " and is reached at <code>/&lt;service&gt;/api/v1/zip</code> with "
         "<code>Authorization: Bearer &lt;key&gt;</code>. Click an endpoint for its interactive "
@@ -921,7 +985,7 @@ def _keys_body(
     if error:
         parts.append(f'<p class="error" role="alert">{html.escape(error)}</p>')
     parts.append(
-        '<form method="post" action="/docs/keys" class="inline-form">'
+        '<form method="post" action="/account/keys" class="inline-form">'
         f'<input type="hidden" name="csrf" value="{token}">'
         '<label>Name <input name="name" maxlength="64" required '
         'placeholder="e.g. laptop scripts"></label><button>Create key</button></form>'
@@ -933,7 +997,7 @@ def _keys_body(
     for key in mine:
         status = "active" if key.active else f"revoked {pages.when(key.revoked)}"
         action = (
-            f'<form method="post" action="/docs/keys/{html.escape(key.prefix)}/revoke">'
+            f'<form method="post" action="/account/keys/{html.escape(key.prefix)}/revoke">'
             f'<input type="hidden" name="csrf" value="{token}"><button>Revoke</button></form>'
             if key.active
             else ""
@@ -999,7 +1063,7 @@ def _zip_body(
         '<iframe id="download" name="download" title="Archive download" hidden></iframe>'
         "<noscript><p>This page needs JavaScript. Without it, use the API: see the "
         '<a href="/docs/api">API reference</a>.</p></noscript>'
-        '<script src="/docs/static/zip.js"></script>'
+        '<script src="/static/zip.js"></script>'
     )
 
 
@@ -1070,8 +1134,8 @@ td form { margin: 0; }
 .new-key pre { user-select: all; }
 """
 
-# The upload page (/docs/zip): select files, then run one job (browser_jobs.py):
-#   1. POST /docs/zip/jobs                 -> job id and its two URLs
+# The upload page (/zip): select files, then run one job (browser_jobs.py):
+#   1. POST /zip/jobs                 -> job id and its two URLs
 #   2. hidden iframe GET .../archive       -> the browser's own download, streamed to disk
 #   3. XHR POST .../files (FormData)       -> upload progress, then the JSON outcome
 # No framework and no build step; everything shown is set with textContent.
@@ -1172,13 +1236,13 @@ _ZIP_JS = r"""
 
     let job;
     try {
-      const response = await fetch('/docs/zip/jobs', {
+      const response = await fetch('/zip/jobs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
         body: JSON.stringify({ service: service() }),
         credentials: 'same-origin',
       });
-      if (response.status === 401) { window.location.href = '/docs/login?next=/docs/zip'; return; }
+      if (response.status === 401) { window.location.href = '/account/login?next=/zip'; return; }
       const body = await response.json().catch(() => null);
       if (!response.ok) { finish(problemText(body, 'Could not start the job.'), 'error'); return; }
       job = body;

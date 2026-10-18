@@ -123,3 +123,54 @@ def test_database_url_must_use_a_supported_driver() -> None:
     assert make_settings(GATEWAY_DATABASE_URL=url).database_url == url
     with pytest.raises(ConfigError, match="GATEWAY_DATABASE_URL"):
         make_settings(GATEWAY_DATABASE_URL="mysql://u:p@localhost/gateway")
+
+
+COGNITO = {
+    "GATEWAY_COGNITO_DOMAIN": "https://zip.auth.eu-west-2.amazoncognito.com",
+    "GATEWAY_COGNITO_CLIENT_ID": "client",
+    "GATEWAY_COGNITO_CLIENT_SECRET": "secret",
+    "GATEWAY_COGNITO_USER_POOL_ID": "eu-west-2_AbC123",
+    "GATEWAY_PUBLIC_URL": "https://zip.example.com",
+}
+
+
+def test_cognito_settings_on_aws() -> None:
+    cognito = make_settings(**COGNITO).cognito
+    assert cognito is not None
+    assert cognito.region == "eu-west-2"
+    assert cognito.token_url == "https://zip.auth.eu-west-2.amazoncognito.com/oauth2/token"
+    assert cognito.jwks_url == (
+        "https://cognito-idp.eu-west-2.amazonaws.com/eu-west-2_AbC123/.well-known/jwks.json"
+    )
+    with pytest.raises(ConfigError, match="GATEWAY_COGNITO_CLIENT_SECRET"):
+        make_settings(**{**COGNITO, "GATEWAY_COGNITO_CLIENT_SECRET": ""})
+    with pytest.raises(ConfigError, match="GATEWAY_PUBLIC_URL"):
+        make_settings(**{**COGNITO, "GATEWAY_PUBLIC_URL": ""})
+
+
+def test_cognito_settings_for_the_local_fake() -> None:
+    cognito = make_settings(
+        **{
+            **COGNITO,
+            "GATEWAY_COGNITO_DOMAIN": "http://localhost:9229",
+            "GATEWAY_COGNITO_BACKCHANNEL_URL": "http://fake-cognito:9229",
+        }
+    ).cognito
+    assert cognito is not None
+    assert cognito.token_url == "http://fake-cognito:9229/oauth2/token"
+    assert cognito.jwks_url == "http://fake-cognito:9229/eu-west-2_AbC123/.well-known/jwks.json"
+    # The issuer stays Cognito's: the gateway verifies the same claim in both places.
+    assert cognito.issuer == "https://cognito-idp.eu-west-2.amazonaws.com/eu-west-2_AbC123"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("GATEWAY_COGNITO_DOMAIN", "http://zip.example.com"),  # plain HTTP only on localhost
+        ("GATEWAY_COGNITO_BACKCHANNEL_URL", "ftp://fake-cognito"),
+        ("GATEWAY_COGNITO_BACKCHANNEL_URL", "http://fake-cognito:9229/path"),
+    ],
+)
+def test_cognito_urls_are_checked(name: str, value: str) -> None:
+    with pytest.raises(ConfigError, match=name):
+        make_settings(**{**COGNITO, name: value})

@@ -61,7 +61,7 @@ async def create_job(
 ) -> AsgiClient:
     client = AsgiClient(
         "POST",
-        "/docs/zip/jobs",
+        "/zip/jobs",
         [*browser.headers(**header_options), ("Content-Type", "application/json")],
     )
     client.feed(json.dumps({"service": service}).encode())
@@ -279,7 +279,7 @@ async def test_creating_a_job_needs_a_session_csrf_and_same_origin() -> None:
         assert (await create_job(app, browser, origin="")).status == 403
         assert (await create_job(app, browser, service="nope")).status == 404
 
-        anonymous = AsgiClient("POST", "/docs/zip/jobs", [("Host", "gw"), ("Origin", "http://gw")])
+        anonymous = AsgiClient("POST", "/zip/jobs", [("Host", "gw"), ("Origin", "http://gw")])
         anonymous.feed(b'{"service": "claude"}')
         await call(app, anonymous)
         assert anonymous.status == 401
@@ -293,9 +293,7 @@ async def test_a_job_belongs_to_the_user_who_created_it() -> None:
         stolen = AsgiClient("GET", job["download"], other.headers(csrf=False))
         await call(app, stolen)
         assert stolen.status == 404
-        guessed = AsgiClient(
-            "GET", "/docs/zip/jobs/" + "A" * 32 + "/archive", owner.headers(csrf=False)
-        )
+        guessed = AsgiClient("GET", "/zip/jobs/" + "A" * 32 + "/archive", owner.headers(csrf=False))
         await call(app, guessed)
         assert guessed.status == 404
 
@@ -333,6 +331,75 @@ def test_per_user_cap_and_expiry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(browser_jobs, "ATTACH_TIMEOUT_SECONDS", -1.0)
     registry.create("claude", "c")  # creating expires the abandoned jobs first
     assert len(registry) == 1
+
+
+async def run_job(handler: Any) -> AsgiClient:
+    """One job against `handler`; the download half, once both halves have finished."""
+    async with FakeUpstream(handler) as fake:
+        app = Gateway(settings_for(fake))
+        browser = Browser(app._settings)
+        job = json.loads((await create_job(app, browser)).body)
+        download = AsgiClient("GET", job["download"], browser.headers(csrf=False))
+        upload = upload_client(browser, job["upload"])
+        upload.feed(f"--{BOUNDARY}--\r\n".encode())
+        await asyncio.gather(call(app, download), call(app, upload))
+    return download
+
+
+async def test_the_download_never_renders_on_the_portal_origin() -> None:
+    """A service answering HTML with a script and a cookie gets neither run nor set: the
+    download is a sandboxed attachment, whatever the service said."""
+
+    async def handler(conn: ServerConn) -> None:
+        await conn.read_request()
+        await conn.read_body()
+        await conn.respond(
+            200,
+            [
+                ("Content-Type", "text/html"),
+                ("Content-Disposition", "inline"),
+                ("Content-Security-Policy", "default-src *"),
+                ("Set-Cookie", "gw_docs_session=forged; Path=/"),
+            ],
+        )
+        await conn.write(b"<script>fetch('/account/keys')</script>")
+        await conn.end()
+
+    download = await run_job(handler)
+    assert download.status == 200
+    assert download.headers["content-disposition"] == "attachment"
+    assert download.headers["content-security-policy"] == "sandbox"
+    assert download.headers["x-content-type-options"] == "nosniff"
+    assert download.headers["cache-control"] == "no-store"
+    assert "set-cookie" not in download.headers
+
+
+async def test_the_download_keeps_the_service_file_name() -> None:
+    async def handler(conn: ServerConn) -> None:
+        await serve_archive(conn, {})
+
+    download = await run_job(handler)
+    assert download.headers["content-disposition"] == DISPOSITION
+    assert download.headers["content-type"] == "application/zip"
+    assert download.headers["content-security-policy"] == "sandbox"
+    assert download.body == b"PK\x03\x04archive"
+
+
+async def test_a_rejection_shows_sandboxed_in_the_frame() -> None:
+    """A problem is not saved as a file, but it is sandboxed like the archive."""
+
+    async def handler(conn: ServerConn) -> None:
+        await conn.read_request()
+        await conn.read_body()
+        await conn.respond(400, [("Content-Type", "text/html"), ("Content-Length", "2")])
+        await conn.write(b"no")
+        await conn.end()
+
+    download = await run_job(handler)
+    assert download.status == 400
+    assert "content-disposition" not in download.headers
+    assert download.headers["content-security-policy"] == "sandbox"
+    assert download.headers["x-content-type-options"] == "nosniff"
 
 
 @pytest.mark.parametrize(

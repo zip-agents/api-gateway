@@ -1,7 +1,7 @@
 # A Cognito user pool for the gateway's portal: invite-only accounts (no self sign-up),
 # email as the username, Cognito's hosted login page, and a confidential app client for
-# the gateway (authorization code + PKCE, client secret). Used by terraform/prod and
-# terraform/dev; see gateway/gateway/accounts/ for the other side.
+# the gateway (authorization code + PKCE, client secret). Used by terraform/prod; see
+# gateway/gateway/accounts/ for the other side, and fake-cognito/ for the local stand-in.
 
 data "aws_region" "current" {}
 
@@ -17,8 +17,9 @@ resource "aws_cognito_user_pool" "main" {
     case_sensitive = false
   }
 
-  # Accounts are created only by the gateway (an invite link) or `make aws-admin`;
-  # Cognito emails the temporary password.
+  # Accounts are created only by the gateway, when someone redeems an invite code (no
+  # email: they choose their own password), or by `make aws-admin`, for which Cognito
+  # emails this temporary password.
   admin_create_user_config {
     allow_admin_create_user_only = true
     invite_message_template {
@@ -62,7 +63,7 @@ resource "aws_cognito_user_pool" "main" {
     email_sending_account = "COGNITO_DEFAULT"
   }
 
-  # Which invite link created the account; set by the gateway, shown on its admin pages.
+  # Which invite code created the account; set by the gateway, shown on its admin pages.
   schema {
     name                     = "invite_id"
     attribute_data_type      = "String"
@@ -78,7 +79,7 @@ resource "aws_cognito_user_pool" "main" {
 resource "aws_cognito_user_group" "admin" {
   name         = "admin"
   user_pool_id = aws_cognito_user_pool.main.id
-  description  = "Can create invite links and see users, sign-ins and API keys in the portal."
+  description  = "Can create invite codes and see users, sign-ins and API keys in the portal."
 }
 
 resource "aws_cognito_user_pool_domain" "main" {

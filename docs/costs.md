@@ -12,7 +12,7 @@ on-demand prices):
 | gateway: 1 task, 0.25 vCPU / 0.5 GB, on-demand | ~$9 | never reclaimed, as the public entry point |
 | claude, grok, dsh: 1 task each, 0.25 vCPU / 1 GB, Fargate Spot | ~$9 | ~70% below on-demand |
 | CloudWatch Logs (14 days), Secrets Manager, ECR, Route 53 zone | ~$3 | |
-| Accounts database: Aurora Serverless v2, paused when idle | ~$1–5 | storage ~$0.11/GB; $0.14 per ACU-hour only while awake (0.5–2 ACU, pauses after 10 idle minutes) |
+| Accounts database: Aurora Serverless v2, paused when idle | ~$1–5 | storage ~$0.11/GB; $0.14 per ACU-hour only while awake (0.5–2 ACU, pauses ~15 minutes after the last query) |
 | Cognito user pool (Lite) | $0 | free under 10,000 monthly active users |
 | **Total, idle** | **~$89** | |
 | Data transfer out (archives downloaded) | +$0.09/GB | the only cost that grows with use |
@@ -63,6 +63,6 @@ caps that per user (control 3 above).
 | One NAT gateway, not one per AZ | ~$37/month | If its AZ fails, tasks lose outbound access (image pulls, logs, secrets). Running tasks keep serving. |
 | Fargate Spot for the zip services | ~$20/month | A task can be reclaimed with 2 minutes' notice. ECS replaces it; in-flight streams to that service are cut. |
 | One task per service | ~$40/month | No redundancy within a service. A deploy starts the new task before stopping the old one, so there's no downtime on deploy. |
-| Aurora pausing at 0 ACU, one instance | ~$45/month (vs. 0.5 ACU always on) | The first request after 10 idle minutes waits ~15 s while it resumes. No standby: if the instance fails, sign-in and user keys are down until Aurora replaces it (operator keys keep working). |
+| Aurora pausing at 0 ACU, one instance | ~$45/month (vs. 0.5 ACU always on) | The first request after it paused waits while it resumes: ~15 s, 30 s or more after a day paused (the gateway retries the connection once). AWS maintenance wakes it for at least 20 minutes. No standby: if the instance fails, sign-in and user keys are down until Aurora replaces it (operator keys keep working). |
 | Container Insights off | ~$5–10/month | No per-task CPU/memory dashboards. The services' JSON logs carry the request-level data. |
 | No WAF | ~$10+/month | No managed rule sets or rate limiting at the edge. If added, exclude `SizeRestrictions_BODY`, which blocks uploads over 8 KB. |

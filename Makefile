@@ -20,13 +20,13 @@ AS_ME := $(if $(ROOTLESS),,--user $(shell id -u):$(shell id -g)) -e HOME=/tmp -e
 
 .DEFAULT_GOAL := help
 .PHONY: help env lock gateway-check gateway-test gateway-fmt test test-unit test-smoke \
-        up up-dsh down logs smoke perf contract-sync contract-check actions-lint act ci shellcheck \
+        up down logs smoke perf contract-sync contract-check actions-lint act ci shellcheck \
         tf-fmt tf-check test-lambda aws-bootstrap aws-plan aws-apply aws-api-keys aws-pause \
-        aws-resume aws-status aws-test-killswitch aws-down aws-nuke dev-auth dev-auth-down \
-        dev-admin aws-admin
+        aws-resume aws-status aws-test-killswitch aws-down aws-nuke \
+        dev-admin fake-cognito-test aws-admin
 
 help: ## List targets
-	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-16s %s\n", $$1, $$2}'
+	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-16s %s\n", $$1, $$2}'
 
 env: ## Create .env with freshly generated local secrets (never overwrites)
 	@test ! -e .env || { echo ".env already exists; leaving it alone"; exit 0; }; \
@@ -50,20 +50,27 @@ gateway-check: ## Gateway lint, types, tests and coverage, in the gateway dev im
 gateway-fmt: ## Apply ruff formatting and safe fixes to the gateway
 	$(MAKE) -C gateway fmt ENGINE=$(ENGINE)
 
-test-unit: gateway-check ## All unit-level checks (containers only)
+test-unit: gateway-check fake-cognito-test ## All unit-level checks (containers only)
 
 test-smoke: up smoke ## Start the stack, then smoke-test every service through the gateway
 
 test: test-unit test-smoke ## Everything: unit checks, then the integrated stack
 
-up: ## Build and start the gateway with claude and grok (http://localhost:8080/docs)
-	$(COMPOSE) up --build --detach --wait
+# The zip services, each from its own repository. One that fails to build or start is
+# reported by `make up` but does not stop the rest of the stack.
+ZIP_SERVICES ?= claude grok dsh
 
-up-dsh: ## Same, including the dsh service
-	$(COMPOSE) --profile dsh up --build --detach --wait
+up: ## Build and start the stack (http://localhost:8080, or your GATEWAY_PORT)
+	$(COMPOSE) up --build --detach --wait gateway
+	@unhealthy=; for s in $(ZIP_SERVICES); do \
+	  $(COMPOSE) up --build --detach --wait --wait-timeout 120 $$s || unhealthy="$$unhealthy $$s"; \
+	done; \
+	if [ -n "$$unhealthy" ]; then \
+	  echo "warning: not healthy:$$unhealthy. The gateway answers 502 for them; see $(COMPOSE) logs <service>." >&2; \
+	fi
 
 down: ## Stop and remove the stack
-	$(COMPOSE) --profile dsh --profile test down --remove-orphans
+	$(COMPOSE) --profile test down --remove-orphans
 
 logs: ## Follow the stack's logs
 	$(COMPOSE) logs --follow
@@ -95,7 +102,7 @@ TERRAFORM_IMAGE ?= hashicorp/terraform:1.16.3
 TFLINT_IMAGE ?= ghcr.io/terraform-linters/tflint:v0.64.0
 TRIVY_IMAGE ?= aquasec/trivy:0.74.0
 TF_RUN = $(ENGINE) run --rm $(AS_ME) -v "$(CURDIR):/work" -w /work
-TF_STACKS = terraform/bootstrap terraform/prod terraform/dev terraform/modules/ecs-service \
+TF_STACKS = terraform/bootstrap terraform/prod terraform/modules/ecs-service \
             terraform/modules/cognito-pool gateway/deploy
 # This repository's Terraform only: the zip services' deploy/ stacks are theirs to check.
 TF_DIRS = terraform gateway/deploy
@@ -118,14 +125,12 @@ test-lambda: ## Unit tests for the budget kill switch
 
 # --------------------------------------------------------------------------- local sign-in
 
-dev-auth: ## Create the free dev Cognito pool (terraform/dev) and point .env at it
-	scripts/dev-auth.sh
+dev-admin: ## Create a portal admin in the local fake-cognito (stack up): make dev-admin EMAIL=you@example.com
+	scripts/cognito-admin.sh dev $(or $(EMAIL),admin@example.com)
 
-dev-auth-down: ## Destroy the dev Cognito pool and remove its settings from .env
-	scripts/dev-auth.sh destroy
-
-dev-admin: ## Create your admin account in the dev pool: make dev-admin EMAIL=you@example.com
-	scripts/cognito-admin.sh dev $(EMAIL)
+fake-cognito-test: ## Contract tests for fake-cognito (boto3, httpx and PyJWT against it)
+	$(ENGINE) build -q --target test -t zip-fake-cognito:test fake-cognito >/dev/null
+	$(ENGINE) run --rm zip-fake-cognito:test
 
 # --------------------------------------------------------------------------- AWS
 

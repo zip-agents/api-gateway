@@ -1,15 +1,23 @@
-"""Invite links: the only way to get an account.
+"""Invite codes: the only way to get an account.
 
-An admin creates a link for a recipient whose email they do not know (it goes to a
-recruiter, who passes it on). Whoever opens it enters their own email; the link is then
-used up, and Cognito emails that address a temporary password.
+An admin creates a one-time code for a recipient whose email they don't know (it goes to
+a recruiter, who passes it on). The recipient opens /account/join, enters the code, and
+chooses their own email and password. No email is sent at any point.
 
-    https://<host>/docs/invite/<token>     token: 24 random bytes, base64url
+    K7QM-4XHT-9CWD     12 characters from 31 unambiguous ones (no 0/O, 1/I/L): ~59 bits
 
-Only SHA-256(token) is stored, so the database cannot reproduce a link. Claiming is a
-single conditional UPDATE (unused and unexpired -> used), so a link works exactly once
-even if it is submitted twice at the same time. If Cognito then refuses to create the
-account (the email already has one), the claim is undone and the link works again.
+That is typeable, and still far beyond guessing: codes expire (1-30 days), work once,
+and the join form allows 10 attempts a minute per client. Only SHA-256 of the normalised
+code is stored, so the database cannot reproduce one.
+
+Redeeming claims the code with a single conditional UPDATE (unused and unexpired ->
+used), so a code works exactly once even if submitted twice at the same moment. If the
+account then cannot be created (the email already has one, the password is refused,
+Cognito fails), the claim is undone and the code works again.
+
+The email address is not verified (nothing is sent to it): Cognito keeps it marked
+unverified, so its forgotten-password email does not apply. A user who loses their
+password gets a new code from an admin.
 """
 
 import hashlib
@@ -19,13 +27,15 @@ from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum
 
-from gateway.accounts.directory import Directory, DirectoryError, UserExists
+from gateway.accounts.directory import Directory, DirectoryError, InvalidPassword, UserExists
 from gateway.accounts.keys import utc_now
 from gateway.accounts.store import InviteRecord, SqlStore
 
 MAX_DAYS = 30
 LABEL_PATTERN = re.compile(r"^[\w .,:()/@&'+-]{1,120}$")
 EMAIL_PATTERN = re.compile(r"^[^@\s]{1,64}@[^@\s]+\.[^@\s]+$")
+CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+CODE_LENGTH = 12
 
 
 class InvalidInvite(ValueError):
@@ -33,24 +43,51 @@ class InvalidInvite(ValueError):
 
 
 class Redeemed(Enum):
-    CREATED = "created"  # account created; Cognito has emailed the temporary password
+    CREATED = "created"  # account created with the chosen password: sign in now
     INVALID = "invalid"  # unknown, used, revoked or expired
-    EXISTS = "exists"  # that email already has an account; the link still works
+    EXISTS = "exists"  # that email already has an account; the code still works
+    BAD_PASSWORD = "bad-password"  # noqa: S105 (an outcome, not a password): code still works
     UNAVAILABLE = "unavailable"  # sign-up is not configured, or Cognito failed
 
 
 @dataclass(frozen=True)
 class NewInvite:
     invite: InviteRecord
-    token: str
+    code: str  # formatted for reading out: XXXX-XXXX-XXXX
 
 
-def token_hash(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
+def new_code() -> str:
+    raw = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LENGTH))
+    return "-".join(raw[i : i + 4] for i in range(0, CODE_LENGTH, 4))
+
+
+def normalise_code(text: str) -> str | None:
+    """The code as stored: upper case, without spaces or dashes. None if malformed."""
+    code = re.sub(r"[\s-]", "", text).upper()
+    if len(code) != CODE_LENGTH or any(c not in CODE_ALPHABET for c in code):
+        return None
+    return code
+
+
+def token_hash(code: str) -> str:
+    return hashlib.sha256(code.encode()).hexdigest()
 
 
 def valid_email(email: str) -> bool:
     return len(email) <= 320 and EMAIL_PATTERN.fullmatch(email) is not None
+
+
+def password_problem(password: str) -> str | None:
+    """The user pool's policy (terraform/modules/cognito-pool), checked before Cognito is."""
+    if len(password) < 12:
+        return "Use at least 12 characters."
+    if len(password) > 256:
+        return "Use at most 256 characters."
+    if not (any(c.islower() for c in password) and any(c.isupper() for c in password)):
+        return "Use both upper and lower case letters."
+    if not any(c.isdigit() for c in password):
+        return "Include at least one number."
+    return None
 
 
 class InviteService:
@@ -67,9 +104,9 @@ class InviteService:
         if not LABEL_PATTERN.fullmatch(label):
             raise InvalidInvite("Use a label of 1-120 plain characters, e.g. 'Recruiter, Acme'.")
         if not 1 <= days <= MAX_DAYS:
-            raise InvalidInvite(f"Links can be valid for 1 to {MAX_DAYS} days.")
+            raise InvalidInvite(f"Codes can be valid for 1 to {MAX_DAYS} days.")
         now = utc_now()
-        token = secrets.token_urlsafe(24)
+        code = new_code()
         invite = InviteRecord(
             id=secrets.token_hex(6),
             label=label,
@@ -77,24 +114,29 @@ class InviteService:
             created=now,
             expires=now + timedelta(days=days),
         )
-        await self._store.create_invite(invite, token_hash(token))
-        return NewInvite(invite, token)
+        normalised = normalise_code(code)
+        assert normalised is not None
+        await self._store.create_invite(invite, token_hash(normalised))
+        return NewInvite(invite, code)
 
-    async def is_open(self, token: str) -> bool:
-        """Whether the link can still be used (for the invite page; never reveals why not)."""
-        return await self._store.invite_open(token_hash(token), utc_now())
-
-    async def redeem(self, token: str, email: str) -> Redeemed:
+    async def redeem(self, code: str, email: str, password: str) -> Redeemed:
+        """Create the account. Email and password are checked by the caller first."""
         if self._directory is None:
             return Redeemed.UNAVAILABLE
-        invite = await self._store.claim_invite(token_hash(token), email, utc_now())
+        normalised = normalise_code(code)
+        if normalised is None:
+            return Redeemed.INVALID
+        invite = await self._store.claim_invite(token_hash(normalised), email, utc_now())
         if invite is None:
             return Redeemed.INVALID
         try:
-            await self._directory.create_user(email, invite.id)
+            await self._directory.create_user(email, invite.id, password)
         except UserExists:
             await self._store.release_invite(invite.id)
             return Redeemed.EXISTS
+        except InvalidPassword:
+            await self._store.release_invite(invite.id)
+            return Redeemed.BAD_PASSWORD
         except DirectoryError:
             await self._store.release_invite(invite.id)
             return Redeemed.UNAVAILABLE

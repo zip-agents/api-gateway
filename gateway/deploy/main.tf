@@ -35,14 +35,18 @@ locals {
 }
 
 # What the running gateway may call: user administration in the platform's user pool
-# (invite links create accounts; admins disable them). Nothing else.
+# (invite codes create accounts; admins disable them). Nothing else.
 data "aws_iam_policy_document" "task" {
   statement {
     sid = "ManageUsers"
     actions = [
       "cognito-idp:AdminCreateUser",
+      "cognito-idp:AdminSetUserPassword", # the password chosen on /account/join
+      "cognito-idp:AdminDeleteUser",      # undo a create whose password was refused
       "cognito-idp:AdminDisableUser",
       "cognito-idp:AdminUserGlobalSignOut",
+      "cognito-idp:AdminGetUser",           # still exists and enabled? (once a minute)
+      "cognito-idp:AdminListGroupsForUser", # still an admin?
     ]
     resources = [local.platform["cognito_user_pool_arn"]]
   }
@@ -78,11 +82,14 @@ module "service" {
     # Within the module's 120 s stopTimeout, so in-flight streams can finish on deploy.
     SHUTDOWN_GRACE_SECONDS = "100"
 
-    # Sign-in with Cognito, and invite links (gateway README, "Accounts and sign-in").
+    # Sign-in with Cognito, and invite codes (gateway README, "Accounts and sign-in").
     GATEWAY_PUBLIC_URL           = "https://${local.platform["domain_name"]}"
     GATEWAY_COGNITO_DOMAIN       = local.platform["cognito_domain"]
     GATEWAY_COGNITO_CLIENT_ID    = local.platform["cognito_client_id"]
     GATEWAY_COGNITO_USER_POOL_ID = local.platform["cognito_user_pool_id"]
+    # Operators sign in with their Cognito admin account; operator keys (the smoke key
+    # among them) are for the API only.
+    GATEWAY_ALLOW_KEY_LOGIN = "false"
 
     # The accounts database (Aurora Serverless v2). Migrations run at startup.
     GATEWAY_DB_HOST = local.platform["database_host"]

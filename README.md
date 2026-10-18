@@ -104,7 +104,10 @@ A master docker compose file will be made in the project root. A `make` script w
 An API gateway will sit in front of these services, treating them as microservices routing to their endpoints via prepending them with the service name.
 For example `/claude/api/v1/zip`. This will require an api token to use
 
-## Notes while executing
+## Working notes while executing
+Dear reader, please don't expect the following sections to be structured too much. They are my thoughts while implementing the project. More for myself.
+Skip to the next section for a more formal writeup after the work has been finished.
+
 ### Claude
 claude wanted confirmation that it couldn't spin up the docker container given that it was running in a podman container. this was confirmed, and I mentioned I would run the commands for it.
 planning was fast, once plan was confirmed it began working.
@@ -138,6 +141,8 @@ this one is slow by comparison to the others. Takes much longer. Once I have a b
 ok, this is taking way to long. the other finished literally yesterday, qwen 3.8 is way too slow. slight change of plan is to setup 3.8 next flash via https://github.com/tonyd2wild/Qwen38-Flash-Next-4x3090/tree/main/vllm-w4a16
 This has literally become the time sink of the project. grok and claude were finished in about 90 min, this is literally taking days. Once I have setup flash, I will see how far it can get in a day. will abandon it after that.
 
+I got flash working, abandoned original qwen stuff, started again with flash.
+
 ### The Qwen flash rabbit hole
 Given the slow speeds of Qwen 3.8, I decided to switch to the new next flash version. Its a more powerful model and its much faster.
 I found a repo that optimised it for the architecure I am running locally (4x Nvidia RTX 3090) but it had a bug where it pinned a nightly vLLM image which no longer existed. I got claude to fix that and I have submitted a pr (https://github.com/tonyd2wild/Qwen38-Flash-Next-4x3090/pull/2)
@@ -147,8 +152,11 @@ I also wound up refactoring my entire agentic dev containers. It was getting to 
 I also decided to task Fable with planning some performance improvements for the qwen flash next runner, to reduce ttft and ideally improve the tokens/s.
 For info, I left Qwen 3.8 overnight and it did finish some parts, but took hours. Tokens/s were approx 18-23, next flash is benchmarking at something like 190.
 
+In practice once running I achieved ~125 tokens/s I will push the changes I made and link later, that deserves a whole writeup itself.
+
+
 ### The API gateway
-I have tasked claude with coming up with a front end API gateway that all the services can live behind, and I got the agents to generate openapi documentation for their respective microservices. The gateway has to do some modifications when serving the docs such that the urls are `<microservice-name>/api/v1/zip`. It seems to work well. I am also going to try adding an authentication layer, 
+I have tasked claude with coming up with a front end API gateway that all the services can live behind, and I got the agents to generate openapi documentation for their respective microservices. The gateway has to do some modifications when serving the docs such that the urls are `<microservice-name>/api/v1/zip`. It seems to work well. I am also going to add an authentication layer
 
 ### general
 I was not explicit enough that models should give me commands to run, dsh tried to install binaries and such to run tests locally. Long term I need to give it some ability to work with docker images, same with the others. Just for convenience.
@@ -159,8 +167,7 @@ Claude finished planning first, then grok, then much later dsh (expected as loca
 all tried to make it dual use as a cli tool, my stupid fault. this resulted in initial flat directory structure which was less readable and poorly organised
 all tried rolling their own zip functionality. The prompt should have explained why we wanted 64 bit, not for the sake of it but for files greater than 4 GiB.
 
-still waiting on qwen to finish, but grok and claude came up with very similar solutions
 
-## Final comparison
+## Post generation writeup
 
 ## Deployment

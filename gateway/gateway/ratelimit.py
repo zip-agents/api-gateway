@@ -1,9 +1,12 @@
-"""A per-client limit on the portal's unauthenticated forms (key sign-in, invite links).
+"""A per-client limit on the portal's unauthenticated forms: key sign-in, and joining
+with an invite code.
 
-The secrets behind them are long and random (API keys >= 32 characters, invite tokens
-192 bits), so this is not what stops guessing. It stops one client from hammering the
-key check, or Cognito through invite redemption. In memory per gateway task: with one
-task that is the whole limit; with more, each task allows its own share.
+API keys are at least 32 random characters, so for sign-in this only stops one client
+hammering the key check. Invite codes are shorter so they can be typed (about 59 bits,
+12 characters from 31): here the limit is part of what makes guessing hopeless, together
+with codes expiring and working once. It also stops a client hammering Cognito through
+account creation. In memory per gateway task: with one task that is the whole limit;
+with more, each task allows its own share.
 """
 
 import time

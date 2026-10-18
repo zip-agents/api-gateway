@@ -1,8 +1,8 @@
 """Sign-in with Amazon Cognito's hosted login: OpenID Connect, authorization code + PKCE.
 
-    /docs/auth/start      state, nonce and a PKCE verifier go into a short-lived signed
-                          cookie (path /docs/auth); the browser goes to Cognito
-    /docs/auth/callback   the code is exchanged at Cognito's token endpoint (with the
+    /account/auth/start      state, nonce and a PKCE verifier go into a short-lived signed
+                          cookie (path /account/auth); the browser goes to Cognito
+    /account/auth/callback   the code is exchanged at Cognito's token endpoint (with the
                           client secret and the PKCE verifier); the ID token is verified
                           here (RS256 against Cognito's JWKS, issuer, audience, expiry,
                           token_use, nonce) and becomes the gateway's own session cookie
@@ -25,7 +25,7 @@ import httpx
 import jwt
 
 FLOW_COOKIE = "gw_oidc_flow"
-FLOW_PATH = "/docs/auth"
+FLOW_PATH = "/account/auth"
 FLOW_SECONDS = 600
 JWKS_SECONDS = 3600
 
@@ -40,6 +40,9 @@ class CognitoSettings:
     client_id: str
     client_secret: str
     user_pool_id: str  # <region>_<id>
+    # Server-to-server base URL (token endpoint, JWKS, admin API) when it differs from what
+    # the browser uses: the compose name of the local fake-cognito. None on AWS.
+    backchannel_url: str | None = None
 
     @property
     def region(self) -> str:
@@ -48,6 +51,16 @@ class CognitoSettings:
     @property
     def issuer(self) -> str:
         return f"https://cognito-idp.{self.region}.amazonaws.com/{self.user_pool_id}"
+
+    @property
+    def token_url(self) -> str:
+        return f"{self.backchannel_url or self.domain}/oauth2/token"
+
+    @property
+    def jwks_url(self) -> str:
+        if self.backchannel_url:
+            return f"{self.backchannel_url}/{self.user_pool_id}/.well-known/jwks.json"
+        return f"{self.issuer}/.well-known/jwks.json"
 
 
 @dataclass(frozen=True)
@@ -137,7 +150,7 @@ class CognitoOidc:
         """Exchange the authorization code and verify the ID token it returns."""
         try:
             response = await self._http.post(
-                f"{self._settings.domain}/oauth2/token",
+                self._settings.token_url,
                 data={
                     "grant_type": "authorization_code",
                     "client_id": self._settings.client_id,
@@ -189,7 +202,7 @@ class CognitoOidc:
     async def _signing_key(self, kid: str) -> Any:
         if time.monotonic() >= self._jwks_expires or kid not in self._jwks:
             # Refetch on expiry, and once on an unknown kid (Cognito rotated its keys).
-            response = await self._http.get(f"{self._settings.issuer}/.well-known/jwks.json")
+            response = await self._http.get(self._settings.jwks_url)
             response.raise_for_status()
             self._jwks = {key["kid"]: key for key in response.json()["keys"]}
             self._jwks_expires = time.monotonic() + JWKS_SECONDS

@@ -63,7 +63,7 @@ class UpstreamConnection:
 async def fetch(
     upstream: Upstream, method: str, path: str, timeout: float, max_bytes: int = READ_SIZE
 ) -> tuple[int, bytes]:
-    """Small whole-body GET for the docs portal. Raises on any failure or oversize body."""
+    """Small whole-body GET for the portal. Raises on any failure or oversize body."""
 
     async def exchange() -> tuple[int, bytes]:
         conn = await UpstreamConnection.open(upstream, timeout)

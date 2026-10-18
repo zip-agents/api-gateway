@@ -65,7 +65,8 @@ class Gateway:
                 await store.close()
 
         self._settings = settings
-        self._proxy = ServiceProxy(settings, Authenticator(keyring, keys), accounts.quota)
+        authenticator = Authenticator(keyring, keys, accounts.users)
+        self._proxy = ServiceProxy(settings, authenticator, accounts.quota)
         jobs = BrowserJobs(
             settings,
             sessions,

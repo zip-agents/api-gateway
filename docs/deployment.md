@@ -71,8 +71,8 @@ make aws-admin EMAIL=you@example.com    # your portal admin account; Cognito ema
    |---|---|---|
    | `AWS_ACCOUNT_ID`, `AWS_REGION` | all four | your account and region |
    | `DOMAIN_NAME` | all four | e.g. `zip.example.com` |
-   | `CLAUDE_REPOSITORY`, `GROK_REPOSITORY`, `DSH_REPOSITORY` | platform | `owner/name`, for the integration workflow |
-   | `SMOKE_SERVICES` | platform | `claude,grok` (add `dsh` once deployed) |
+   | `CLAUDE_REPOSITORY`, `GROK_REPOSITORY`, `DSH_REPOSITORY` | platform | `owner/name`, for the manual `integration` workflow (the whole stack on a runner) |
+   | `SMOKE_SERVICES` | platform | `claude,grok,dsh`: the services the live smoke test covers |
 
 4. Set the secret `SMOKE_API_KEY` (the `smoke` key) in all four repositories. If the
    repositories are private, also give the platform repository a fine-grained read-only
@@ -87,11 +87,16 @@ make aws-admin EMAIL=you@example.com    # your portal admin account; Cognito ema
 1. Merge to `main` here. `plan-apply` applies the platform, runs the gateway checks, then
    deploys the gateway: push the image, `terraform apply`, and a post-deploy check.
    Then merge to `main` in **claude** and **grok**, which deploy themselves the same way.
-2. Open `https://<domain>/docs` and sign in with your admin account. Create invite
-   links on Admin → Invites.
+2. Open `https://<domain>` and sign in with your admin account. Create invite
+   codes on Admin → Invites. Zip a large file once on `/zip`: `live-smoke` can't cover
+   the browser upload on AWS, since operator-key sign-in is off there.
 3. Run `live-smoke` from the platform repository's Actions tab. It includes a 32 MiB
    full-duplex upload through the load balancer, which proves streaming end to end on
    AWS.
+4. Check that Aurora really pauses: about 15 minutes after the last sign-in, the
+   cluster's CloudWatch metric `ServerlessDatabaseCapacity` drops to 0, and its RDS
+   events show the pause and the resume (`RDS-EVENT-0370` to `RDS-EVENT-0374`) when you
+   next sign in. If capacity never reaches 0, something holds a connection open.
 
 ## Day to day
 
@@ -141,7 +146,7 @@ is no true hard cap on AWS.
 ## Accounts and sign-in
 
 People sign in to the portal with Cognito, and get an account only through an invite
-link from an admin (see the gateway README, "Accounts and sign-in").
+code from an admin (see the gateway README, "Accounts and sign-in").
 
 - **The pool:** `terraform/prod/auth.tf` (module `terraform/modules/cognito-pool`):
   invite-only, email as username, Cognito's hosted login, group `admin`, and an app
@@ -149,23 +154,33 @@ link from an admin (see the gateway README, "Accounts and sign-in").
   (`/zip-platform/prod/cognito_*`); the client secret goes into Secrets Manager
   (`zip-platform/prod/cognito`), so it is also in this stack's encrypted state.
 - **The first admin:** after `make aws-apply`, run `make aws-admin EMAIL=you@example.com`.
-  Cognito emails a temporary password; sign in at `https://<domain>/docs/login` and
-  choose your own. Then create invite links on `/docs/admin/invites`.
-- **Locally:** `make dev-auth` creates a separate, free dev pool (`terraform/dev`, local
-  state, callback `http://localhost:8080`) and writes its settings into `.env`. Then
-  `make up` and `make dev-admin EMAIL=you@example.com`. `make dev-auth-down` removes it;
-  `make aws-nuke` does too.
+  Cognito emails a temporary password; sign in at `https://<domain>/account/login` and
+  choose your own. Then create invite codes on `/account/admin/invites`.
+- **Locally:** no AWS at all. `make up` includes **fake-cognito**, a local stand-in that
+  speaks the parts of Cognito's API the gateway uses (hosted sign-in, tokens and keys,
+  the admin calls), so the gateway runs its production code against it.
+  `make dev-admin EMAIL=you@example.com` creates an admin with the real AWS CLI; the
+  emails Cognito would send are at `http://localhost:9229/outbox`. Real Cognito is first
+  exercised on AWS, by the rehearsal.
 - **Teardown:** the prod pool goes with `make aws-down`, and with it every account and
   invite. That is intended: nothing outlives the interview.
 - **The database:** `terraform/prod/database.tf`. Aurora PostgreSQL Serverless v2, one
   instance in the private subnets, reachable only from the gateway's security group,
-  encrypted at rest, verified TLS from the gateway. It scales to 0 ACU and pauses after 10 idle
-  minutes; the first request after that waits ~15 s. The gateway runs the migrations at
+  encrypted at rest, verified TLS from the gateway. It scales to 0 ACU and pauses about
+  15 minutes after the last query: an open connection, even an idle one, keeps it awake,
+  so the gateway closes its pooled connections after 5 minutes without a query
+  (`IdleCloser` in `gateway/accounts/store.py`), and Aurora pauses 10 minutes after that.
+  The first request afterwards waits while it resumes: about 15 s, 30 s or more after a
+  day paused. The gateway waits up to 60 s for a connection and retries once
+  (`gateway/accounts/connect.py`). AWS maintenance wakes it, and it then stays up at
+  least 20 minutes. The gateway runs the migrations at
   startup. The password is generated as an ephemeral value and written only to the
   cluster and to Secrets Manager (`zip-platform/prod/database`), so it is never in
   Terraform state. To change it, bump `database_password_version` in `database.tf`, apply,
   and restart the gateway.
 - **The gateway's AWS permissions:** a task role (the module's `task_role_policy_json`)
-  that may only create, disable and sign out users in the prod pool.
+  that may only, in the prod pool: create users with the password they chose (and delete
+  one whose password was refused), disable and sign them out, and read whether a user
+  still exists, is enabled and is an admin.
 - **Email:** Cognito's default sender, about 50 emails a day. Enough for invites.
 - **Cost:** $0. Under 10,000 monthly active users the Lite tier is free.

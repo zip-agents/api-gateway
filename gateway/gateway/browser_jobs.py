@@ -5,10 +5,10 @@ upload request is limited by the service's output buffer (contract §4.1). A job
 the work into two requests that run at the same time, and joins them here into one
 streaming exchange with the service:
 
-    POST /docs/zip/jobs                   {"service": "claude"} -> {"id", "upload", "download"}
-    GET  /docs/zip/jobs/<id>/archive      the archive: a normal browser download, streamed
+    POST /zip/jobs                   {"service": "claude"} -> {"id", "upload", "download"}
+    GET  /zip/jobs/<id>/archive      the archive: a normal browser download, streamed
                                           to disk under the service's Content-Disposition
-    POST /docs/zip/jobs/<id>/files        the multipart upload; answered after the exchange
+    POST /zip/jobs/<id>/files        the multipart upload; answered after the exchange
                                           with a small JSON outcome
 
 The upload request's body feeds the service (ServiceProxy.forward, the same path as the
@@ -195,6 +195,41 @@ def archive_name(content_disposition: str) -> str | None:
     return plain.group(1) if plain else None
 
 
+# Replaced on the download: it is a navigation on the portal origin, with the session
+# cookie, so whatever a service answers must never render or run there.
+_DOWNLOAD_REPLACED = frozenset(
+    {
+        b"set-cookie",
+        b"content-disposition",
+        b"content-security-policy",
+        b"x-content-type-options",
+        b"cache-control",
+    }
+)
+
+
+def download_headers(start: Message) -> list[tuple[bytes, bytes]]:
+    """The service's response headers, made safe for the download frame.
+
+    A 200 is always saved as a file (the service's file name kept); anything else (a
+    problem) may show in the hidden frame, but sandboxed and never sniffed as HTML.
+    """
+    headers: list[tuple[bytes, bytes]] = start["headers"]
+    kept = [(name, value) for name, value in headers if name.lower() not in _DOWNLOAD_REPLACED]
+    if start["status"] == 200:
+        disposition = next(
+            (value for name, value in headers if name.lower() == b"content-disposition"), b""
+        )
+        _, separator, parameters = disposition.partition(b";")
+        kept.append((b"content-disposition", b"attachment" + separator + parameters))
+    kept += [
+        (b"content-security-policy", b"sandbox"),
+        (b"x-content-type-options", b"nosniff"),
+        (b"cache-control", b"no-store"),
+    ]
+    return kept
+
+
 class BrowserJobs:
     """The three job endpoints. Plain ASGI where bodies stream, so nothing buffers."""
 
@@ -222,8 +257,8 @@ class BrowserJobs:
         session = self._sessions.verify(token)
         if session is None:
             return None, token
-        if self._users is not None and not await self._users.allowed(session):
-            return None, token  # disabled since signing in
+        if self._users is not None and await self._users.check(session) is None:
+            return None, token  # disabled or signed out since
         return session.owner, token
 
     async def _guard(self, scope: Scope, *, state_changing: bool) -> tuple[str | None, str | None]:
@@ -270,7 +305,7 @@ class BrowserJobs:
         except TooManyJobs:
             await self._problem(scope, receive, send, "overloaded", headers={"Retry-After": "5"})
             return
-        base = f"/docs/zip/jobs/{job.id}"
+        base = f"/zip/jobs/{job.id}"
         response = JSONResponse(
             {"id": job.id, "upload": f"{base}/files", "download": f"{base}/archive"},
             status_code=201,
@@ -309,6 +344,8 @@ class BrowserJobs:
                     # The exchange ended without completing the response: return without
                     # the final body message, so the browser sees a failed download.
                     return
+                if message["type"] == "http.response.start":
+                    message = {**message, "headers": download_headers(message)}
                 try:
                     await send(message)
                 except OSError:

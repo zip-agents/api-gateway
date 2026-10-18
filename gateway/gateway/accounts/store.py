@@ -6,28 +6,35 @@ The secret part of an API key is never stored, only its SHA-256 (see keys.py).
 
 The schema is created and upgraded by Alembic (migrate.py), once per process, before the
 first query. Health checks and operator keys never touch the database, so an idle Aurora
-cluster can pause.
+cluster can pause; and pooled connections are closed after IDLE_CLOSE_SECONDS without a
+query, as Aurora does not pause while any connection is open (`IdleCloser`).
 """
 
 import asyncio
+import contextlib
 import ssl
+import time
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import case, delete, insert, make_url, select, update
+from sqlalchemy import case, delete, event, insert, make_url, select, update
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from gateway.accounts.connect import begin
 from gateway.accounts.migrate import migrate
 from gateway.accounts.schema import api_keys, invites, logins, usage_daily, users
 
-# A paused Aurora Serverless cluster takes ~15 s to resume on first connection.
-CONNECT_TIMEOUT_SECONDS = 30
+# A paused Aurora Serverless cluster resumes on the first connection: ~15 s, 30 s or
+# more after a day paused. Opening a connection is also retried once (connect.py).
+CONNECT_TIMEOUT_SECONDS = 60
+# Close idle pooled connections well before Aurora's auto-pause (10 minutes, database.tf).
+IDLE_CLOSE_SECONDS = 300.0
 # Amazon RDS's CA bundle, for GATEWAY_DB_SSL=verify-full (see certs/README.md).
 RDS_CA_BUNDLE = Path(__file__).resolve().parent.parent / "certs" / "rds-global-bundle.pem"
 _LIST_LIMIT = 1000
@@ -121,6 +128,7 @@ class UserRecord:
     last_login: datetime | None
     login_count: int
     disabled: datetime | None
+    sessions_valid_after: datetime | None = None
 
     @property
     def active(self) -> bool:
@@ -169,6 +177,7 @@ def _user(row: RowMapping) -> UserRecord:
         last_login=_utc(row["last_login"]),
         login_count=int(row["login_count"]),
         disabled=_utc(row["disabled"]),
+        sessions_valid_after=_utc(row["sessions_valid_after"]),
     )
 
 
@@ -186,11 +195,62 @@ def _invite(row: RowMapping) -> InviteRecord:
     )
 
 
+class IdleCloser:
+    """Close the pool's connections once none has been used for `idle_seconds`.
+
+    The pool would otherwise keep them open for good, and an open connection, even an idle
+    one, keeps Aurora Serverless awake. The next query opens a new connection (waiting for
+    Aurora to resume if it paused). Watches the pool's checkout and checkin events, so it
+    covers every query; a timer runs only while connections are open.
+    """
+
+    def __init__(self, engine: AsyncEngine, idle_seconds: float) -> None:
+        self._engine = engine
+        self._idle = idle_seconds
+        self._in_use = 0
+        self._last_used = time.monotonic()
+        self._timer: asyncio.Task[None] | None = None
+        # Listeners on the engine carry over to the new pool that dispose() creates.
+        event.listen(engine.sync_engine, "checkout", self._checkout)
+        event.listen(engine.sync_engine, "checkin", self._checkin)
+
+    def _checkout(self, *_: object) -> None:
+        self._in_use += 1
+
+    def _checkin(self, *_: object) -> None:
+        self._in_use = max(0, self._in_use - 1)
+        self._last_used = time.monotonic()
+        if self._timer is None:
+            # Pool events run inside the event loop's thread (SQLAlchemy's greenlets).
+            self._timer = asyncio.get_running_loop().create_task(self._close_when_idle())
+
+    async def _close_when_idle(self) -> None:
+        try:
+            while True:
+                left = self._last_used + self._idle - time.monotonic()
+                if self._in_use == 0 and left <= 0:
+                    await self._engine.dispose()
+                    return
+                await asyncio.sleep(left if left > 0 else self._idle)  # in use: look again
+        finally:
+            self._timer = None
+
+    async def stop(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._timer
+
+
 class SqlStore:
-    def __init__(self, engine: AsyncEngine) -> None:
+    def __init__(self, engine: AsyncEngine, idle_close_seconds: float = IDLE_CLOSE_SECONDS) -> None:
         self._engine = engine
         self._ready = False
         self._lock = asyncio.Lock()
+        # Not SQLite: its single shared connection is the in-memory database.
+        self._idle_closer = (
+            None if engine.dialect.name == "sqlite" else IdleCloser(engine, idle_close_seconds)
+        )
 
     @classmethod
     def from_url(cls, url: str) -> "SqlStore":
@@ -206,11 +266,13 @@ class SqlStore:
                 self._ready = True
 
     async def close(self) -> None:
+        if self._idle_closer is not None:
+            await self._idle_closer.stop()
         await self._engine.dispose()
 
     async def _execute(self, statement: Any) -> Any:
         await self.ensure_schema()
-        async with self._engine.begin() as connection:
+        async with begin(self._engine) as connection:
             return await connection.execute(statement)
 
     async def create_key(self, key: ApiKeyRecord) -> None:
@@ -283,7 +345,7 @@ class SqlStore:
         login events older than LOGIN_RETENTION.
         """
         await self.ensure_schema()
-        async with self._engine.begin() as connection:
+        async with begin(self._engine) as connection:
             existing = (
                 (await connection.execute(select(users).where(users.c.sub == sub)))
                 .mappings()
@@ -352,10 +414,16 @@ class SqlStore:
             for row in rows
         ]
 
+    async def end_sessions(self, sub: str, when: datetime) -> None:
+        """Refuse every session of this user issued before `when` (they signed out)."""
+        await self._execute(
+            update(users).where(users.c.sub == sub).values(sessions_valid_after=when)
+        )
+
     async def disable_user(self, sub: str, when: datetime) -> bool:
         """Disable a user and revoke all their API keys, in one transaction."""
         await self.ensure_schema()
-        async with self._engine.begin() as connection:
+        async with begin(self._engine) as connection:
             result = await connection.execute(
                 update(users)
                 .where(users.c.sub == sub, users.c.disabled.is_(None))
@@ -405,14 +473,6 @@ class SqlStore:
             .one()
         )
         return _invite(row)
-
-    async def invite_open(self, token_hash: str, now: datetime) -> bool:
-        query = select(invites.c.id).where(
-            invites.c.token_hash == token_hash,
-            invites.c.status == "unused",
-            invites.c.expires > now,
-        )
-        return (await self._execute(query)).first() is not None
 
     async def release_invite(self, invite_id: str) -> None:
         """Undo a claim whose account could not be created, so the link works again."""

@@ -1,4 +1,4 @@
-"""HTML for the account pages: sign-in, invite links, and the admin pages.
+"""HTML for the account pages: sign-in, joining with an invite code, and the admin pages.
 
 Server-rendered, no script; every value is escaped. State-changing forms carry the
 session's CSRF token in a hidden field (checked with the Origin by the portal).
@@ -49,12 +49,13 @@ def login_body(next_path: str, error: str | None, *, cognito: bool, key_login: b
     parts = [f"<h1>Sign in</h1>{message}"]
     if cognito:
         parts.append(
-            f'<p><a class="button" href="/docs/auth/start?next={_e(next_path)}">Sign in</a></p>'
-            '<p class="muted">You need an invite link to have an account.</p>'
+            f'<p><a class="button" href="/account/auth/start?next={_e(next_path)}">Sign in</a></p>'
+            '<p class="muted">No account yet? <a href="/account/join">Join with an invite '
+            "code</a>.</p>"
         )
     if key_login:
         form = (
-            '<form method="post" action="/docs/login" class="login">'
+            '<form method="post" action="/account/login" class="login">'
             f'<input type="hidden" name="next" value="{_e(next_path)}">'
             '<label>API key <input type="password" name="api_key" '
             'autocomplete="current-password" required></label><button>Sign in with a key</button>'
@@ -73,19 +74,30 @@ def message_body(title: str, text: str, *, link: tuple[str, str] | None = None) 
     return f"<h1>{_e(title)}</h1><p>{_e(text)}</p>{action}"
 
 
-# ------------------------------------------------------------------------------ invite link
+# ------------------------------------------------------------------------------ joining
 
 
-def invite_form(token: str, error: str | None = None) -> str:
+def join_form(code: str = "", email: str = "", error: str | None = None) -> str:
+    """/account/join: an invite code, and the email and password the person chooses."""
     message = f'<p class="error" role="alert">{_e(error)}</p>' if error else ""
     return (
-        "<h1>You're invited</h1>"
-        "<p>Enter your email address. We'll create your account and Amazon Cognito will "
-        "email you a temporary password; you choose your own when you first sign in.</p>"
-        f'{message}<form method="post" action="/docs/invite/{_e(token)}" class="login">'
+        "<h1>Create your account</h1>"
+        "<p>Enter the invite code you were given, and choose the email address and password "
+        "you will sign in with.</p>"
+        f'{message}<form method="post" action="/account/join" class="login">'
+        '<label>Invite code <input name="code" autocomplete="one-time-code" '
+        'placeholder="XXXX-XXXX-XXXX" maxlength="20" spellcheck="false" required '
+        f'value="{_e(code)}"{"" if code else " autofocus"}></label>'
         '<label>Email <input type="email" name="email" autocomplete="email" maxlength="320" '
-        "required autofocus></label><button>Create my account</button></form>"
-        '<p class="muted">The link works once.</p>'
+        f'required value="{_e(email)}"{" autofocus" if code else ""}></label>'
+        '<label>Password <input type="password" name="password" autocomplete="new-password" '
+        'minlength="12" maxlength="256" required></label>'
+        '<label>Password again <input type="password" name="confirm" '
+        'autocomplete="new-password" minlength="12" maxlength="256" required></label>'
+        '<p class="muted">At least 12 characters, with upper and lower case letters and a '
+        "number.</p><button>Create my account</button></form>"
+        '<p class="muted">A code works once. Nothing is emailed to you: keep your password '
+        "safe, as a lost one needs a new code from whoever invited you.</p>"
     )
 
 
@@ -97,7 +109,7 @@ def admin_tabs(current: str) -> str:
     links = " &middot; ".join(
         f"<strong>{label}</strong>"
         if slug == current
-        else f'<a href="/docs/admin/{slug}">{label}</a>'
+        else f'<a href="/account/admin/{slug}">{label}</a>'
         for slug, label in tabs
     )
     return f'<p class="crumb">Admin: {links}</p>'
@@ -107,7 +119,8 @@ def admin_invites_body(
     invites: Sequence[InviteRecord],
     csrf: str,
     *,
-    new_link: str | None,
+    new_code: str | None,
+    join_url: str,
     error: str | None,
     enabled: bool,
     now: datetime,
@@ -116,33 +129,35 @@ def admin_invites_body(
     if not enabled:
         parts.append(
             '<p class="error">Sign-up is not configured (no Cognito user pool), so invite '
-            "links cannot create accounts here.</p>"
+            "codes cannot create accounts here.</p>"
         )
     parts.append(
-        "<p>Create a one-time link and send it to whoever should get an account; they enter "
-        "their own email when they open it.</p>"
+        "<p>Create a one-time code and give it to whoever should get an account. They enter "
+        f"it at <code>{_e(join_url)}</code> and choose their own email and password.</p>"
     )
-    if new_link:
+    if new_code:
         parts.append(
-            '<div class="new-key" role="status"><p><strong>New invite link.</strong> Copy it '
+            '<div class="new-key" role="status"><p><strong>New invite code.</strong> Copy it '
             "now: it is shown only once.</p>"
-            f"<pre><code>{_e(new_link)}</code></pre></div>"
+            f'<pre><code class="invite-code">{_e(new_code)}</code></pre>'
+            f"<p>To pass on: &ldquo;Create your account at {_e(join_url)} with the code "
+            f"{_e(new_code)}.&rdquo;</p></div>"
         )
     if error:
         parts.append(f'<p class="error" role="alert">{_e(error)}</p>')
     parts.append(
-        '<form method="post" action="/docs/admin/invites" class="inline-form">'
+        '<form method="post" action="/account/admin/invites" class="inline-form">'
         f"{_csrf(csrf)}"
         '<label>Label <input name="label" maxlength="120" required '
         'placeholder="e.g. Recruiter, Acme"></label>'
         f'<label>Valid for (days) <input name="days" type="number" min="1" max="{MAX_DAYS}" '
-        'value="7" required></label><button>Create link</button></form>'
+        'value="7" required></label><button>Create code</button></form>'
     )
     rows = []
     for invite in invites:
         state = invite.state(now)
         action = (
-            _post_button(f"/docs/admin/invites/{invite.id}/revoke", "Revoke", csrf)
+            _post_button(f"/account/admin/invites/{invite.id}/revoke", "Revoke", csrf)
             if state == "unused"
             else ""
         )
@@ -182,7 +197,7 @@ def admin_users_body(
     rows = []
     for user in users:
         action = (
-            _post_button(f"/docs/admin/users/{user.sub}/disable", "Disable", csrf)
+            _post_button(f"/account/admin/users/{user.sub}/disable", "Disable", csrf)
             if user.active
             else ""
         )
@@ -224,7 +239,7 @@ def admin_keys_body(keys: Sequence[ApiKeyRecord], csrf: str) -> str:
     for key in keys:
         status = "active" if key.active else f"revoked {when(key.revoked)}"
         action = (
-            _post_button(f"/docs/admin/keys/{key.prefix}/revoke", "Revoke", csrf)
+            _post_button(f"/account/admin/keys/{key.prefix}/revoke", "Revoke", csrf)
             if key.active
             else ""
         )

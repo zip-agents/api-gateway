@@ -53,7 +53,7 @@ test-postgres: dev-image ## Store, account and quota tests against a real Postgr
 	  'for i in $$(seq 1 30); do pg_isready -U gateway -h 127.0.0.1 && exit 0; sleep 1; done; exit 1'
 	$(ENGINE) run --rm --network zip-gateway-test \
 	  -e GATEWAY_TEST_DATABASE_URL=postgresql+asyncpg://gateway:gateway@zip-gateway-postgres:5432/gateway \
-	  $(DEV_IMAGE) pytest tests/test_keys.py tests/test_accounts_portal.py tests/test_quota.py -v; status=$$?; \
+	  $(DEV_IMAGE) pytest tests/test_keys.py tests/test_accounts_portal.py tests/test_quota.py tests/test_security.py -v; status=$$?; \
 	  $(ENGINE) rm -f zip-gateway-postgres >/dev/null; $(ENGINE) network rm zip-gateway-test >/dev/null; \
 	  exit $$status
 

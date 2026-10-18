@@ -3,7 +3,7 @@
 # upload, and the docs endpoints. Nightly and on demand; each service's deploy workflow
 # runs its own post-deploy check.
 #
-# Needs repository variables DOMAIN_NAME and SMOKE_SERVICES (e.g. claude,grok), and the
+# Needs repository variables DOMAIN_NAME and SMOKE_SERVICES (e.g. claude,grok,dsh), and the
 # secret SMOKE_API_KEY (from `make aws-api-keys`).
 name: live-smoke
 
@@ -25,7 +25,7 @@ jobs:
         env:
           GATEWAY_URL: https://${{ vars.DOMAIN_NAME }}
           API_KEY: ${{ secrets.SMOKE_API_KEY }}
-          SERVICES: ${{ vars.SMOKE_SERVICES || 'claude,grok' }}
+          SERVICES: ${{ vars.SMOKE_SERVICES || 'claude,grok,dsh' }}
         run: |
           docker build -t zip-smoke smoke
           docker run --rm --tmpfs /tmp:size=1g \

@@ -100,6 +100,11 @@ resource "aws_lb_listener" "https" {
   ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
   certificate_arn   = aws_acm_certificate_validation.main.certificate_arn
 
+  # HSTS on every response, the portal's and the proxied ones: browsers stop trying plain
+  # HTTP (and stop letting a network attacker downgrade them). No includeSubDomains: the
+  # domain may be the apex, and that would force HTTPS on every other subdomain too.
+  routing_http_response_strict_transport_security_header_value = "max-age=31536000"
+
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.gateway.arn

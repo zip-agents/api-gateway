@@ -20,12 +20,12 @@ variable "login_url" {
 }
 
 variable "callback_urls" {
-  description = "The gateway's /docs/auth/callback URL(s)."
+  description = "The gateway's /account/auth/callback URL(s)."
   type        = list(string)
 }
 
 variable "logout_urls" {
-  description = "Where Cognito may send the browser after signing out: the gateway's /docs/login."
+  description = "Where Cognito may send the browser after signing out: the gateway's /account/login."
   type        = list(string)
 }
 

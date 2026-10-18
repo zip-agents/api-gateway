@@ -1,4 +1,4 @@
-"""The gateway app end to end in-process: routing, request IDs, health and the docs portal."""
+"""The gateway app end to end in-process: routing, request IDs, health and the portal."""
 
 import copy
 import json
@@ -9,11 +9,14 @@ import httpx
 import pytest
 
 from gateway.app import Gateway
+from gateway.config import ConfigError
 from gateway.docs import DocsSite
 from gateway.service_docs import InvalidDocs, parse_manifest
 from tests.support import API_KEY, FakeUpstream, ServerConn, make_settings
 
 pytestmark = pytest.mark.anyio
+
+ORIGIN = {"Origin": "http://gw"}
 
 MANIFEST = {
     "service": "zip-service",
@@ -65,13 +68,15 @@ def client_for(upstreams: str) -> httpx.AsyncClient:
 
 
 async def sign_in(client: httpx.AsyncClient) -> None:
-    response = await client.post("/docs/login", data={"api_key": API_KEY, "next": "/docs"})
+    response = await client.post(
+        "/account/login", data={"api_key": API_KEY, "next": "/docs"}, headers=ORIGIN
+    )
     assert response.status_code == 303
     assert response.headers["location"] == "/docs"
     cookie = response.headers["set-cookie"].lower()
     assert "httponly" in cookie
     assert "samesite=lax" in cookie
-    assert "path=/docs" in cookie
+    assert "path=/;" in cookie
 
 
 async def test_health_needs_no_auth() -> None:
@@ -125,13 +130,13 @@ async def test_docs_redirect_to_login_until_signed_in(service: FakeUpstream) -> 
             "/docs/api",
             "/docs/api/claude",
             "/docs/compare",
-            "/docs/zip",
+            "/zip",
             "/docs/pages/contract",
             "/docs/services/claude/readme",
         ):
             response = await client.get(path)
             assert response.status_code == 303
-            assert response.headers["location"].startswith("/docs/login?next=")
+            assert response.headers["location"].startswith("/account/login?next=")
         assert (await client.get("/docs/openapi.yaml")).status_code == 401
         assert (await client.get("/docs/openapi/contract.json")).status_code == 401
         assert (await client.get("/docs/openapi/claude/service.json")).status_code == 401
@@ -139,19 +144,21 @@ async def test_docs_redirect_to_login_until_signed_in(service: FakeUpstream) -> 
 
 async def test_login_rejects_a_wrong_key_and_unsafe_redirects() -> None:
     async with client_for("claude=http://127.0.0.1:1") as client:
-        response = await client.post("/docs/login", data={"api_key": "wrong"})
+        response = await client.post("/account/login", data={"api_key": "wrong"}, headers=ORIGIN)
         assert response.status_code == 401
         assert "set-cookie" not in response.headers
         response = await client.post(
-            "/docs/login", data={"api_key": API_KEY, "next": "https://evil.example/docs"}
+            "/account/login",
+            data={"api_key": API_KEY, "next": "https://evil.example/docs"},
+            headers=ORIGIN,
         )
-        assert response.headers["location"] == "/docs"
+        assert response.headers["location"] == "/"
 
 
 async def test_home_shows_status_build_and_service_docs(service: FakeUpstream) -> None:
     async with client_for(f"claude={service.url},grok=http://127.0.0.1:1") as client:
         await sign_in(client)
-        response = await client.get("/docs")
+        response = await client.get("/")
     assert response.status_code == 200
     assert "default-src 'none'" in response.headers["content-security-policy"]
     page = response.text
@@ -275,7 +282,7 @@ async def test_compare_page_reports_differences(service: FakeUpstream) -> None:
 async def test_logout_clears_the_session() -> None:
     async with client_for("claude=http://127.0.0.1:1") as client:
         await sign_in(client)
-        response = await client.post("/docs/logout")
+        response = await client.post("/account/logout", headers=ORIGIN)
         assert response.status_code == 303
         assert "max-age=0" in response.headers["set-cookie"].lower()
 
@@ -319,8 +326,8 @@ def test_manifest_metadata_is_optional_and_titles_default() -> None:
 async def test_zip_page_lists_services_and_carries_a_csrf_token(service: FakeUpstream) -> None:
     async with client_for(f"claude={service.url},grok=http://127.0.0.1:1") as client:
         await sign_in(client)
-        page = await client.get("/docs/zip")
-        script = await client.get("/docs/static/zip.js")
+        page = await client.get("/zip")
+        script = await client.get("/static/zip.js")
     assert page.status_code == 200
     csp = page.headers["content-security-policy"]
     assert "script-src 'self'" in csp
@@ -329,9 +336,9 @@ async def test_zip_page_lists_services_and_carries_a_csrf_token(service: FakeUps
     assert 'data-csrf="' in page.text
     assert 'value="claude" checked>' in page.text  # the first ready service is preselected
     assert 'value="grok" disabled>' in page.text  # unreachable services cannot be chosen
-    assert 'href="/docs/zip"' in page.text  # in the header and the nav
+    assert 'href="/zip"' in page.text  # in the header and the nav
     assert script.headers["content-type"].startswith("text/javascript")
-    assert "/docs/zip/jobs" in script.text
+    assert "/zip/jobs" in script.text
 
 
 async def test_my_api_keys_create_use_and_revoke(service: FakeUpstream) -> None:
@@ -339,29 +346,29 @@ async def test_my_api_keys_create_use_and_revoke(service: FakeUpstream) -> None:
 
     async with client_for(f"claude={service.url}") as client:
         await sign_in(client)
-        page = await client.get("/docs/keys")
+        page = await client.get("/account/keys")
         assert page.status_code == 200
         csrf = re.search(r'name="csrf" value="([^"]+)"', page.text)
         assert csrf is not None
         same_origin = {"Origin": "http://gw"}
 
-        refused = await client.post("/docs/keys", data={"name": "laptop"}, headers=same_origin)
+        refused = await client.post("/account/keys", data={"name": "laptop"}, headers=same_origin)
         assert refused.status_code == 403  # no CSRF token
         cross_site = await client.post(
-            "/docs/keys",
+            "/account/keys",
             data={"name": "laptop", "csrf": csrf.group(1)},
             headers={"Origin": "https://evil.example"},
         )
         assert cross_site.status_code == 403
 
         created = await client.post(
-            "/docs/keys", data={"name": "laptop", "csrf": csrf.group(1)}, headers=same_origin
+            "/account/keys", data={"name": "laptop", "csrf": csrf.group(1)}, headers=same_origin
         )
         assert created.status_code == 200
         key = re.search(r"(zk_[a-z0-9]{8}_[A-Za-z0-9_-]{43})", created.text)
         assert key is not None
         prefix = key.group(1)[3:11]
-        listing = (await client.get("/docs/keys")).text
+        listing = (await client.get("/account/keys")).text
         assert f"zk_{prefix}_..." in listing
         assert key.group(1) not in listing  # shown once, never again
 
@@ -369,12 +376,12 @@ async def test_my_api_keys_create_use_and_revoke(service: FakeUpstream) -> None:
         assert (await client.get("/claude/health/ready", headers=bearer)).status_code == 200
 
         revoked = await client.post(
-            f"/docs/keys/{prefix}/revoke", data={"csrf": csrf.group(1)}, headers=same_origin
+            f"/account/keys/{prefix}/revoke", data={"csrf": csrf.group(1)}, headers=same_origin
         )
         assert revoked.status_code == 303
         assert (await client.get("/claude/health/ready", headers=bearer)).status_code == 401
         again = await client.post(
-            f"/docs/keys/{prefix}/revoke", data={"csrf": csrf.group(1)}, headers=same_origin
+            f"/account/keys/{prefix}/revoke", data={"csrf": csrf.group(1)}, headers=same_origin
         )
         assert again.status_code == 404
 
@@ -384,13 +391,33 @@ async def test_invalid_key_names_are_explained(service: FakeUpstream) -> None:
 
     async with client_for(f"claude={service.url}") as client:
         await sign_in(client)
-        csrf = re.search(r'name="csrf" value="([^"]+)"', (await client.get("/docs/keys")).text)
+        csrf = re.search(r'name="csrf" value="([^"]+)"', (await client.get("/account/keys")).text)
         assert csrf is not None
         response = await client.post(
-            "/docs/keys",
+            "/account/keys",
             data={"name": "<script>", "csrf": csrf.group(1)},
             headers={"Origin": "http://gw"},
         )
     assert response.status_code == 422
     assert "Use 1-64 letters" in response.text
     assert "<script>" not in response.text.split("<main>")[1].split("</form>")[0]
+
+
+async def test_docs_hold_only_documentation(service: FakeUpstream) -> None:
+    async with client_for(f"claude={service.url}") as client:
+        assert (await client.get("/docs")).headers["location"] == "/account/login?next=/docs"
+        await sign_in(client)
+        index = await client.get("/docs")
+    assert index.status_code == 200
+    assert "<h1>Documentation</h1>" in index.text
+    assert 'href="/docs/api/claude"' in index.text
+    assert 'href="/docs/services/claude/readme"' in index.text
+    # Sign-in, zipping, keys and admin live outside /docs.
+    assert 'action="/account/logout"' in index.text
+    assert 'href="/zip"' in index.text
+
+
+@pytest.mark.parametrize("name", ["account", "zip", "docs", "static"])
+def test_portal_paths_cannot_be_service_names(name: str) -> None:
+    with pytest.raises(ConfigError, match="reserved"):
+        make_settings(GATEWAY_UPSTREAMS=f"{name}=http://127.0.0.1:1")

@@ -156,7 +156,7 @@ jobs:
     timeout-minutes: 30
     environment:
       name: prod
-      url: https://${{ vars.DOMAIN_NAME }}/docs
+      url: https://${{ vars.DOMAIN_NAME }}/
     permissions:
       contents: read
       id-token: write
@@ -197,7 +197,7 @@ jobs:
     timeout-minutes: 30
     environment:
       name: prod
-      url: https://${{ vars.DOMAIN_NAME }}/docs
+      url: https://${{ vars.DOMAIN_NAME }}/
     permissions:
       contents: read
       id-token: write
@@ -246,7 +246,7 @@ jobs:
           echo
           # Authentication is enforced, and the portal answers.
           test "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/claude/health/ready")" = 401
-          test "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/docs/login")" = 200
+          test "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/account/login")" = 200
           # Proxying works for a service that is up (a 502 here means it is not deployed).
           curl -fsS -H "Authorization: Bearer $API_KEY" "$BASE/claude/health/ready" \
             || echo "::warning::claude is not reachable through the gateway yet"

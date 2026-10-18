@@ -60,8 +60,10 @@ _DROP_REQUEST = frozenset(
     }
 )
 # uvicorn frames the response itself (chunked unless Content-Length is passed through).
+# A service has no business setting cookies on the gateway's origin.
 _DROP_RESPONSE = frozenset(
     {
+        b"set-cookie",
         b"connection",
         b"keep-alive",
         b"proxy-authenticate",

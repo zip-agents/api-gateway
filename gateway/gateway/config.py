@@ -107,6 +107,8 @@ _COGNITO_VARIABLES = (
     "GATEWAY_COGNITO_USER_POOL_ID",
 )
 _POOL_ID = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d_[A-Za-z0-9]+$")
+# The local fake-cognito's hosted login, reached by the browser over plain HTTP.
+_LOCAL_HTTP = re.compile(r"^http://(localhost|127\.0\.0\.1)(:\d{1,5})?$")
 
 
 def _cognito(env: Mapping[str, str]) -> CognitoSettings | None:
@@ -117,8 +119,22 @@ def _cognito(env: Mapping[str, str]) -> CognitoSettings | None:
     if missing:
         raise ConfigError(f"Cognito sign-in also needs {', '.join(missing)}")
     domain = values["GATEWAY_COGNITO_DOMAIN"].rstrip("/")
-    if not domain.startswith("https://"):
-        raise ConfigError("GATEWAY_COGNITO_DOMAIN must be the https:// hosted-login domain")
+    if not (domain.startswith("https://") or _LOCAL_HTTP.fullmatch(domain)):
+        raise ConfigError(
+            "GATEWAY_COGNITO_DOMAIN must be the https:// hosted-login domain "
+            "(or http://localhost:<port> for the local fake-cognito)"
+        )
+    backchannel = env.get("GATEWAY_COGNITO_BACKCHANNEL_URL", "").strip().rstrip("/") or None
+    if backchannel is not None:
+        parts = urlsplit(backchannel)
+        if parts.scheme not in ("http", "https") or not parts.hostname or parts.path:
+            raise ConfigError("GATEWAY_COGNITO_BACKCHANNEL_URL must be http(s)://host[:port]")
+        if not _LOCAL_HTTP.fullmatch(domain):
+            # Tokens are verified with keys fetched from here: on AWS that must be Cognito.
+            raise ConfigError(
+                "GATEWAY_COGNITO_BACKCHANNEL_URL is only for the local fake-cognito: "
+                "GATEWAY_COGNITO_DOMAIN must then be http://localhost:<port>"
+            )
     if not _POOL_ID.fullmatch(values["GATEWAY_COGNITO_USER_POOL_ID"]):
         raise ConfigError("GATEWAY_COGNITO_USER_POOL_ID must look like eu-west-2_AbC123")
     return CognitoSettings(
@@ -126,6 +142,7 @@ def _cognito(env: Mapping[str, str]) -> CognitoSettings | None:
         client_id=values["GATEWAY_COGNITO_CLIENT_ID"],
         client_secret=values["GATEWAY_COGNITO_CLIENT_SECRET"],
         user_pool_id=values["GATEWAY_COGNITO_USER_POOL_ID"],
+        backchannel_url=backchannel,
     )
 
 
@@ -224,7 +241,7 @@ def parse_api_keys(value: str) -> dict[str, str]:
 
 
 # First path segments the gateway serves itself; a service cannot be named after one.
-RESERVED_PREFIXES = frozenset({"docs", "health", "static", "api"})
+RESERVED_PREFIXES = frozenset({"docs", "health", "static", "api", "account", "zip"})
 
 
 def _items(value: str) -> list[str]:

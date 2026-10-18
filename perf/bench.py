@@ -7,7 +7,7 @@ streaming service answers during the upload, a buffering one only after it.
 Environment:
     GATEWAY_URL   e.g. http://gateway:8000 (plain HTTP only: run it next to the gateway)
     API_KEY       a key from GATEWAY_API_KEYS
-    SERVICES      comma-separated, e.g. claude,grok
+    SERVICES      comma-separated, e.g. claude,grok,dsh
     SIZE_MIB      size of the single-file uploads (default 100)
     PARALLEL      concurrent requests in the parallel scenario (default 4)
     CSV           optional path: also write the results as CSV
@@ -27,7 +27,7 @@ import h11
 
 GATEWAY = urlsplit(os.environ.get("GATEWAY_URL", "http://gateway:8000"))
 API_KEY = os.environ.get("API_KEY", "")
-SERVICES = [s for s in os.environ.get("SERVICES", "claude,grok").split(",") if s]
+SERVICES = [s for s in os.environ.get("SERVICES", "claude,grok,dsh").split(",") if s]
 SIZE_MIB = int(os.environ.get("SIZE_MIB", "100"))
 PARALLEL = int(os.environ.get("PARALLEL", "4"))
 MIB = 1024 * 1024

@@ -1,11 +1,12 @@
-"""API-key authentication and the docs session cookie.
+"""API-key authentication and the portal's session cookie.
 
 Two credentials, deliberately kept apart:
 
 * API calls (`/<service>/...`) need `Authorization: Bearer <key>`. Cookies are never
   accepted there, so a logged-in browser cannot be tricked into uploading (no CSRF).
-* The docs portal (`/docs`) is for browsers, which cannot attach a bearer header to a
-  page load. Signing in with an API key sets a signed, HttpOnly cookie scoped to `/docs`.
+* The portal (`/`, `/zip`, `/account/...`, `/docs/...`) is for browsers, which cannot
+  attach a bearer header to a page load. Signing in sets a signed, HttpOnly cookie for the
+  whole site; the proxy never reads it, and strips it before forwarding a request.
 
 Keys are compared by SHA-256 digest with `hmac.compare_digest`, checking every key so the
 time taken does not reveal which one nearly matched.
@@ -17,10 +18,10 @@ import hmac
 import json
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 SESSION_COOKIE = "gw_docs_session"
-SESSION_PATH = "/docs"
+SESSION_PATH = "/"  # the portal and its docs; the API never reads cookies
 
 
 class KeyRing:
@@ -56,7 +57,8 @@ class Session:
 
     owner: str  # "op:<operator key name>" (API-key sign-in) or "user:<cognito sub>"
     label: str  # what pages show: the key name, or the user's email
-    admin: bool = False  # members of the Cognito "admin" group
+    admin: bool = False  # members of the Cognito "admin" group (re-checked: users.py)
+    issued: float = field(default=0.0, compare=False)  # when signed in (Unix time)
 
     @property
     def operator_key(self) -> str | None:
@@ -87,11 +89,10 @@ class SessionSigner:
     def issue(self, who: Session | str, now: float | None = None) -> str:
         """A token for `who` (a bare string is an operator key name)."""
         session = who if isinstance(who, Session) else Session(f"op:{who}", who)
-        issued = int(time.time() if now is None else now)
-        claims = {"o": session.owner, "l": session.label, "a": session.admin}
-        payload = _b64encode(
-            json.dumps({**claims, "exp": issued + self._ttl}, separators=(",", ":")).encode()
-        )
+        issued = time.time() if now is None else now  # sub-second: see users.py
+        claims = {"o": session.owner, "l": session.label, "a": session.admin, "iat": issued}
+        expires = int(issued) + self._ttl
+        payload = _b64encode(json.dumps({**claims, "exp": expires}, separators=(",", ":")).encode())
         return f"{payload}.{self._sign(payload)}"
 
     def verify(self, token: str | None, now: float | None = None) -> Session | None:
@@ -115,7 +116,10 @@ class SessionSigner:
             return None
         if expires <= (time.time() if now is None else now):
             return None
-        session = Session(owner, label, admin)
+        issued = claims.get("iat")
+        if isinstance(issued, bool) or not isinstance(issued, int | float):
+            issued = expires - self._ttl  # sessions issued before "iat" was added
+        session = Session(owner, label, admin, issued)
         if session.operator_key is not None and session.operator_key not in self._keyring:
             return None
         if session.operator_key is None and session.user_sub is None:

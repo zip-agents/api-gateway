@@ -6,6 +6,8 @@ from tests.test_portal import client_for
 
 pytestmark = pytest.mark.anyio
 
+ORIGIN = {"Origin": "http://gw"}
+
 
 def test_limit_per_client_and_window() -> None:
     limiter = RateLimiter(limit=3, window_seconds=60)
@@ -26,15 +28,20 @@ def test_memory_is_bounded() -> None:
 async def test_key_sign_in_is_limited_per_client() -> None:
     async with client_for("claude=http://127.0.0.1:1") as client:
         wrong = {"api_key": "x" * 40, "next": "/docs"}
-        statuses = [(await client.post("/docs/login", data=wrong)).status_code for _ in range(10)]
+        statuses = [
+            (await client.post("/account/login", data=wrong, headers=ORIGIN)).status_code
+            for _ in range(10)
+        ]
         assert statuses == [401] * 10
-        limited = await client.post("/docs/login", data={"api_key": API_KEY, "next": "/docs"})
+        limited = await client.post(
+            "/account/login", data={"api_key": API_KEY, "next": "/docs"}, headers=ORIGIN
+        )
         assert limited.status_code == 429
         assert int(limited.headers["retry-after"]) > 0
         # Behind the load balancer, the client is the last X-Forwarded-For entry.
         other = await client.post(
-            "/docs/login",
+            "/account/login",
             data={"api_key": API_KEY, "next": "/docs"},
-            headers={"X-Forwarded-For": "203.0.113.9"},
+            headers={**ORIGIN, "X-Forwarded-For": "203.0.113.9"},
         )
         assert other.status_code == 303

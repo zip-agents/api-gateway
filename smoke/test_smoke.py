@@ -1,6 +1,6 @@
 """Smoke tests for every zip service, run through the gateway exactly as clients use it.
 
-Each test runs once per service in $SERVICES (default: claude,grok). They check the parts
+Each test runs once per service in $SERVICES (default: claude,grok,dsh). They check the parts
 of the contract a deploy most often breaks, plus the gateway hop itself (auth, request
 IDs, streaming), and finish in seconds. Exhaustive contract tests live in each service's
 own repository.
@@ -26,7 +26,7 @@ import pytest
 
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://gateway:8000").rstrip("/")
 API_KEY = os.environ.get("API_KEY", "")
-SERVICES = [s.strip() for s in os.environ.get("SERVICES", "claude,grok").split(",") if s.strip()]
+SERVICES = [s.strip() for s in os.environ.get("SERVICES", "claude,grok,dsh").split(",") if s.strip()]
 LARGE_UPLOAD_MIB = int(os.environ.get("LARGE_UPLOAD_MIB", "64"))
 SSL_VERIFY = os.environ.get("SSL_VERIFY", "true").lower() != "false"
 
@@ -222,14 +222,19 @@ def test_browser_upload_job_streams_at_any_size(service: str, tmp_path: Path) ->
             handle.write(chunk)
 
     with httpx.Client(base_url=GATEWAY_URL, verify=SSL_VERIFY, timeout=300) as browser:
-        signed_in = browser.post("/docs/login", data={"api_key": API_KEY, "next": "/docs/zip"})
+        signed_in = browser.post("/account/login", data={"api_key": API_KEY, "next": "/zip"},
+                                headers={"Origin": GATEWAY_URL})
+        if signed_in.status_code == 404:
+            # Prod turns operator-key sign-in off (gateway/deploy/main.tf), so the smoke
+            # key can't reach the portal; this runs locally and in integration instead.
+            pytest.skip("key sign-in is off on this deployment")
         assert signed_in.status_code == 303, signed_in.text
-        page = browser.get("/docs/zip")
+        page = browser.get("/zip")
         csrf = re.search(r'data-csrf="([^"]+)"', page.text)
         assert csrf, "no CSRF token on the upload page"
         same_origin = {"Origin": GATEWAY_URL, "X-CSRF-Token": csrf.group(1)}
 
-        created = browser.post("/docs/zip/jobs", json={"service": service}, headers=same_origin)
+        created = browser.post("/zip/jobs", json={"service": service}, headers=same_origin)
         assert created.status_code == 201, created.text
         job = created.json()
 

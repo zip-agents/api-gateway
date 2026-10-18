@@ -172,7 +172,7 @@ async def test_browser_jobs_are_refused_once_the_quota_is_used(store: SqlStore) 
 
     client = AsgiClient(
         "POST",
-        "/docs/zip/jobs",
+        "/zip/jobs",
         [
             ("Host", "gw"),
             ("Origin", "http://gw"),

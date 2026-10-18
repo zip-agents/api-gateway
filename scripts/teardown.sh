@@ -38,11 +38,6 @@ tf terraform/prod destroy -auto-approve
 
 [ "$action" = "nuke" ] || { echo "== down: done. To bring it back: make aws-apply, then re-run each service's deploy workflow."; exit 0; }
 
-if [ -f "$ROOT/terraform/dev/terraform.tfstate" ]; then
-  echo "== destroying the dev Cognito pool (terraform/dev)"
-  "$ROOT/scripts/dev-auth.sh" destroy
-fi
-
 echo "== moving bootstrap state back to local, then destroying the bootstrap stack"
 OVERRIDE="$ROOT/terraform/bootstrap/local_override.tf"
 tf terraform/bootstrap init -input=false

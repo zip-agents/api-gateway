@@ -5,11 +5,16 @@ Two separate doors, with separate credentials:
 - **The API** (`/<service>/api/v1/zip`) takes only `Authorization: Bearer <key>`. Cookies
   are never accepted there, so a signed-in browser can't be made to call the API from
   another site.
-- **The portal** (`/docs/...`) takes only the gateway's own session cookie. Browsers get
-  it by signing in with Cognito, or with an operator API key.
+- **The portal** (`/` home, `/zip`, `/account/...` and the docs under `/docs/...`) takes
+  only the gateway's own session cookie. Browsers get
+  it by signing in with Cognito, or, locally only, with an operator API key (off in prod).
 
 Code: `gateway/gateway/auth.py` (keys, sessions, CSRF), `gateway/gateway/accounts/`
 (Cognito, invites, user keys, quota). Infrastructure: `terraform/modules/cognito-pool`.
+
+**Locally there is no cloud:** `fake-cognito/` stands in for Cognito at the same paths
+and in the same formats, so every diagram below holds with "Cognito" read as
+fake-cognito (`http://localhost:9229`, outbox at `/outbox`). Real Cognito is checked on AWS.
 
 ## Credentials at a glance
 
@@ -22,7 +27,7 @@ flowchart LR
 
     subgraph gateway[Gateway]
         api["API<br/>/{service}/api/v1/zip"]
-        portal["Portal<br/>/docs/..."]
+        portal["Portal<br/>/  /zip  /account  /docs"]
     end
 
     subgraph zip[Zip services]
@@ -31,7 +36,7 @@ flowchart LR
 
     subgraph stores[Where secrets live]
         sm[("Secrets Manager<br/>operator keys,<br/>session secret")]
-        db[("Aurora<br/>SHA-256 of user keys<br/>and invite tokens, users,<br/>sign-ins, daily usage")]
+        db[("Aurora<br/>SHA-256 of user keys<br/>and invite codes, users,<br/>sign-ins, daily usage")]
         cognito[("Cognito<br/>accounts and passwords,<br/>group admin")]
     end
 
@@ -49,11 +54,11 @@ flowchart LR
 
 | Credential | Who has it | Stored as | Gets you |
 |---|---|---|---|
-| Operator API key | automation (smoke tests), operators | plain, in Secrets Manager (`GATEWAY_API_KEYS`) | the API, no quota; portal sign-in without admin |
-| User API key `zk_<prefix>_<secret>` | a user, made on `/docs/keys` (at most 5) | SHA-256 of the secret, in Aurora | the API, counted against the user's daily quota |
-| Cognito password (+ optional TOTP) | a user, after an invite | in Cognito only | portal sign-in; admin pages if in group `admin` |
-| Session cookie `gw_docs_session` | a signed-in browser | nowhere: HMAC-signed, HttpOnly, SameSite=Lax, path `/docs`, 12 h | the portal; disabled users are refused within a minute |
-| Invite link `/docs/invite/<token>` | whoever an admin sends it to | SHA-256 of the token, in Aurora | one account, once, before it expires (1–30 days) |
+| Operator API key | automation (smoke tests), operators | plain, in Secrets Manager (`GATEWAY_API_KEYS`) | the API, no quota. Locally also portal sign-in without admin; in prod key sign-in is off (`GATEWAY_ALLOW_KEY_LOGIN=false`) |
+| User API key `zk_<prefix>_<secret>` | a user, made on `/account/keys` (at most 5) | SHA-256 of the secret, in Aurora | the API, counted against the user's daily quota |
+| Cognito password (+ optional TOTP) | a user, chosen when joining | in Cognito only | portal sign-in; admin pages if in group `admin` |
+| Session cookie `gw_docs_session` | a signed-in browser | nowhere: HMAC-signed, HttpOnly, SameSite=Lax, path `/` (the API never reads it), 12 h | the portal; refused within a minute once the user is disabled or deleted (here or in Cognito), and at once after they sign out |
+| Invite code `XXXX-XXXX-XXXX` | whoever an admin gives it to | SHA-256 of the code, in Aurora | one account, with an email and password they choose at `/account/join`, once, before it expires (1–30 days) |
 
 ## Signing in with Cognito
 
@@ -68,26 +73,29 @@ sequenceDiagram
     participant C as Cognito (hosted login)
     participant DB as Aurora
 
-    U->>G: GET /docs/zip (no session)
-    G-->>U: 303 /docs/login?next=/docs/zip
-    U->>G: GET /docs/auth/start?next=/docs/zip
-    Note over G: new state, nonce and PKCE verifier,<br/>in a signed 10-minute cookie (path /docs/auth)
+    U->>G: GET /zip (no session)
+    G-->>U: 303 /account/login?next=/zip
+    U->>G: GET /account/auth/start?next=/zip
+    Note over G: new state, nonce and PKCE verifier,<br/>in a signed 10-minute cookie (path /account/auth)
     G-->>U: 303 to Cognito /oauth2/authorize<br/>(client_id, state, nonce, S256 challenge)
     U->>C: email + password (+ TOTP)
-    C-->>U: 302 /docs/auth/callback?code&state
-    U->>G: GET /docs/auth/callback (with the flow cookie)
+    C-->>U: 302 /account/auth/callback?code&state
+    U->>G: GET /account/auth/callback (with the flow cookie)
     Note over G: state must match the flow cookie
     G->>C: POST /oauth2/token (code, verifier, client secret)
     C-->>G: ID token
     Note over G: verify RS256 against Cognito's JWKS,<br/>issuer, audience, expiry, token_use=id, nonce
     G->>DB: user disabled? record the sign-in<br/>(first one links the invite)
-    G-->>U: 303 /docs/zip + session cookie<br/>{user:sub, email, admin from group}
+    G-->>U: 303 /zip + session cookie<br/>{user:sub, email, admin from group}
 ```
 
 Signing out clears the cookie and also ends Cognito's own session (`/logout`), so the
 next sign-in asks for the password again.
 
-## Getting an account: invite links
+## Getting an account: invite codes
+
+The admin doesn't know the recipient's email, so the recipient chooses it, along with
+their password, on the site. Nothing is emailed.
 
 ```mermaid
 sequenceDiagram
@@ -98,22 +106,23 @@ sequenceDiagram
     participant DB as Aurora
     participant C as Cognito
 
-    A->>G: POST /docs/admin/invites (label, days, CSRF token)
-    G->>DB: store SHA-256(token), expiry
-    G-->>A: the link, shown once
-    A-->>R: sends the link (e.g. through a recruiter)
-    R->>G: GET /docs/invite/{token}
-    G->>DB: unused and unexpired?
-    G-->>R: "enter your email"
-    R->>G: POST email (same Origin, 10 posts/min per IP)
-    G->>DB: claim: one conditional UPDATE<br/>(works once, even if sent twice at once)
-    G->>C: AdminCreateUser(email, custom:invite_id)
+    A->>G: POST /account/admin/invites (label, days, CSRF token)
+    G->>DB: store SHA-256(code), expiry
+    G-->>A: the code (e.g. K7QM-4XHT-9CWD), shown once
+    A-->>R: passes on the code and /account/join (e.g. through a recruiter)
+    R->>G: GET /account/join
+    G-->>R: code, email, password, password again
+    R->>G: POST the form (same Origin, 10 posts/min per IP)
+    Note over G: email valid, passwords match,<br/>password meets the pool's policy
+    G->>DB: claim: one conditional UPDATE<br/>(unused, unexpired, works once even if sent twice)
+    G->>C: AdminCreateUser(email unverified, custom:invite_id), no email sent
+    G->>C: AdminSetUserPassword(chosen password, permanent)
     alt created
-        C-->>R: email with a temporary password
-        G-->>R: "check your email"
-    else email already has an account, or Cognito failed
-        G->>DB: release the claim (the link works again)
-        G-->>R: explain, and keep the form
+        G-->>R: "your account is ready", then sign in as usual
+    else email taken, password refused, or Cognito failed
+        G->>C: AdminDeleteUser (only if half-made)
+        G->>DB: release the claim (the code works again)
+        G-->>R: explain, keeping the code and email (never the password)
     end
 ```
 
@@ -132,7 +141,7 @@ sequenceDiagram
         Note over G: constant-time compare against the keyring.<br/>No database, no quota.
     else user key zk_{prefix}_{secret}
         G->>DB: look up the prefix (cached 60 s)
-        Note over G: compare SHA-256(secret),<br/>not revoked, owner not disabled
+        Note over G: compare SHA-256(secret), not revoked,<br/>owner still valid (user active, operator key configured)
         G->>DB: today's bytes for the owner (cached 60 s)
         opt over the daily quota
             G-->>S: 429 quota-exceeded, Retry-After until 00:00 UTC
@@ -158,9 +167,17 @@ here too.
 
 - **Signature and expiry** of the session cookie. An operator session also needs its key
   to still be in the keyring.
-- **Disabled users** are refused. The check is cached 60 s per task, and is immediate on
-  the task where the admin disabled them.
-- **Admin pages** need the `admin` flag, taken from the Cognito group at sign-in.
+- **Users who are disabled, deleted in Cognito, or signed out since** are refused. The
+  check asks the database and Cognito when a request comes in, keeps the answer 60 s per
+  user and task (so a busy user costs one lookup a minute, an idle one none), and is
+  immediate on the task where the change was made.
+- **Admin pages** need membership of the Cognito `admin` group, looked up the same way
+  for admin sessions only: removing someone from the group applies within a minute;
+  adding someone applies at their next sign-in. If Cognito can't be reached, admin rights
+  wait until it answers.
+- **Signing in and out** need a same-origin `Origin`, so another site can't sign a visitor
+  in or out.
 - **Every state-changing form** needs `Origin` equal to the gateway's public origin, plus
   the CSRF token.
-- **Rate limits:** 10 posts a minute per IP on key sign-in and invite redemption.
+- **Rate limits:** 10 posts a minute per IP on key sign-in (where it is on) and on
+  joining with a code.
