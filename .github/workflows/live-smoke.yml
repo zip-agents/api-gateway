@@ -4,7 +4,7 @@
 # runs its own post-deploy check.
 #
 # Needs repository variables DOMAIN_NAME and SMOKE_SERVICES (e.g. claude,grok,dsh), and the
-# secret SMOKE_API_KEY (from `make aws-api-keys`).
+# secret SMOKE_API_KEY (docs/aws-runbook.md, step 4).
 name: live-smoke
 
 on:

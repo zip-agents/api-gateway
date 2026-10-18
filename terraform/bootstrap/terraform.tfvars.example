@@ -1,15 +1,15 @@
-# Copy to terraform.tfvars. It holds no secrets, so it can be committed.
+# Copy to terraform.tfvars, which is gitignored: it holds your email, and the repository is public.
 region      = "eu-west-2"
 alert_email = "you@example.com"
 
 # owner/name of the repository each service deploys from. The keys name the services.
 # The gateway lives in the platform repository, so both point at it.
 github_repositories = {
-  platform = "OWNER/zip-platform"
-  gateway  = "OWNER/zip-platform"
-  claude   = "OWNER/zip-claude"
-  grok     = "OWNER/zip-grok"
-  dsh      = "OWNER/zip-dsh"
+  platform = "zip-agents/api-gateway"
+  gateway  = "zip-agents/api-gateway"
+  claude   = "zip-agents/claude-code"
+  grok     = "zip-agents/grok-build"
+  dsh      = "zip-agents/dsh-qwen-flash-next"
 }
 
 monthly_budget_usd = 100

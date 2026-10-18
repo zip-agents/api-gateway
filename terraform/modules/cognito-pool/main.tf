@@ -18,7 +18,7 @@ resource "aws_cognito_user_pool" "main" {
   }
 
   # Accounts are created only by the gateway, when someone redeems an invite code (no
-  # email: they choose their own password), or by `make aws-admin`, for which Cognito
+  # email: they choose their own password), or by hand (docs/aws-runbook.md), for which Cognito
   # emails this temporary password.
   admin_create_user_config {
     allow_admin_create_user_only = true

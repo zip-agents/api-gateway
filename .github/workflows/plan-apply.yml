@@ -3,7 +3,7 @@
 # the platform first, then deploy the gateway, so a change touching both lands in order
 # (the gateway reads what the platform publishes). Only what changed runs.
 #
-# The bootstrap stack is never applied by CI (make aws-bootstrap, by an administrator).
+# The bootstrap stack is never applied by CI (by an administrator, by hand: docs/aws-runbook.md).
 # The zip services deploy from their own repositories.
 #
 # Needs repository variables AWS_ACCOUNT_ID, AWS_REGION and DOMAIN_NAME, the secret
@@ -26,7 +26,7 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: "What to apply: both, platform, or gateway (e.g. after make aws-down)"
+        description: "What to apply: both, platform, or gateway (e.g. to redeploy the gateway)"
         type: choice
         options: [both, platform, gateway]
         default: both

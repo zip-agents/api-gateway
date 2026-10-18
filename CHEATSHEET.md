@@ -53,27 +53,17 @@ make lock                               # re-resolve gateway/uv.lock
 
 ## AWS
 
-```bash
-# once
-make aws-bootstrap                      # state, CI roles, ECR, budget, kill switch
-make aws-apply                          # shared platform (CI applies on merge afterwards)
-make aws-api-keys NAMES="smoke you"     # operator keys (printed once; restarts gateway)
-make aws-admin EMAIL=you@example.com    # portal admin; Cognito emails a temp password
+Nothing in the Makefile talks to AWS. The manual commands are in `docs/aws-runbook.md`:
+bootstrap, platform, operator keys, portal admin, pause, kill-switch test and final
+cleanup. CD does the rest:
 
-# day to day
-make aws-status                         # task counts
-make aws-plan                           # plan the platform
-make aws-pause                          # everything to 0 tasks (~$2.2/day remains)
-make aws-resume                         # back up
-make aws-test-killswitch                # fire the budget kill switch (undo: aws-resume)
-
-# teardown
-make aws-down                           # services + platform (keeps bootstrap, ~$1/month)
-make aws-nuke                           # everything
-```
-
-After `aws-down`, bringing it back is `aws-apply`, then `aws-api-keys`, then `aws-admin`,
-then run `plan-apply` with target `gateway`, then each service's `deploy` workflow.
+| Workflow | When |
+|---|---|
+| `plan-apply` | plan on pull requests; apply the platform, then deploy the gateway, on `main` |
+| each service's `deploy` | after its CI passes on `main` |
+| `live-smoke` | nightly, against the live site |
+| `nuke` | daily check: destroys everything once `NUKE_AFTER` passes or the budget is spent; or by hand |
+| `integration` | by hand: the whole stack on a runner, a commit per service |
 
 ## Where things are
 
@@ -82,7 +72,7 @@ then run `plan-apply` with target `gateway`, then each service's `deploy` workfl
 | Gateway configuration (env vars) | `gateway/README.md`, "Configuration" |
 | Prod gateway settings | `gateway/deploy/main.tf` |
 | Local settings | `.env` (from `.env.example`) |
-| AWS region/profile | `platform.env` |
+| Manual AWS commands | `docs/aws-runbook.md` |
 | Logs on AWS | CloudWatch `/zip-platform/prod/<service>`; Logs Insights `filter request_id = "<id>"` |
 | Credentials and sign-in | `docs/auth.md` |
 | Costs and the budget | `docs/costs.md` |

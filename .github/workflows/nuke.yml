@@ -1,0 +1,97 @@
+# Destroy the platform for good (scripts/nuke.sh), so a forgotten deployment cannot keep
+# costing money. Checked every day; it runs when either:
+#   - today is on or after the repository variable NUKE_AFTER (YYYY-MM-DD), or
+#   - this month's actual spend has reached the budget (the kill switch has already
+#     scaled everything to 0 by then; this removes what still costs money while paused).
+# It can also be run by hand: type "nuke" to confirm.
+#
+# Afterwards it disables plan-apply and live-smoke here, so nothing is recreated. Service
+# deploys fail harmlessly: the platform parameters they read are gone.
+#
+# Needs repository variables AWS_ACCOUNT_ID, AWS_REGION and NUKE_AFTER. The run fails
+# (and GitHub emails you) while NUKE_AFTER is missing, as a reminder. The `prod`
+# environment must not require reviewers, or the scheduled run waits for an approval.
+name: nuke
+
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "nuke" to destroy everything now'
+        required: true
+
+concurrency:
+  group: terraform-prod
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  nuke:
+    name: Nuke when due
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: prod
+    permissions:
+      contents: read
+      id-token: write
+      actions: write # to disable the workflows that would recreate the platform
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      NUKE_AFTER: ${{ vars.NUKE_AFTER }}
+      CONFIRM: ${{ inputs.confirm }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/zip-platform-platform-deploy
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Due?
+        id: due
+        shell: bash
+        run: |
+          set -euo pipefail
+          reason=
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            [ "$CONFIRM" = nuke ] || { echo "::error::type nuke to confirm"; exit 1; }
+            reason="run by hand"
+          else
+            [[ "$NUKE_AFTER" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+              || { echo "::error::set the repository variable NUKE_AFTER (YYYY-MM-DD)"; exit 1; }
+            today="$(date -u +%F)"
+            if [[ ! "$today" < "$NUKE_AFTER" ]]; then reason="NUKE_AFTER ($NUKE_AFTER) reached"; fi
+            read -r spent limit < <(aws budgets describe-budget \
+              --account-id "${{ vars.AWS_ACCOUNT_ID }}" --budget-name zip-platform-monthly \
+              --query 'Budget.[CalculatedSpend.ActualSpend.Amount, BudgetLimit.Amount]' \
+              --output text 2>/dev/null || echo "0 1")
+            echo "spent \$$spent of \$$limit this month; nuke after $NUKE_AFTER"
+            if awk -v s="$spent" -v l="$limit" 'BEGIN { exit !(s >= l) }'; then
+              reason="budget spent (\$$spent of \$$limit)"
+            fi
+          fi
+          if [ -n "$reason" ]; then
+            echo "::warning::nuking: $reason"
+            echo "due=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "not due"
+            echo "due=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: hashicorp/setup-terraform@v4
+        if: steps.due.outputs.due == 'true'
+        with:
+          terraform_version: "1.16.3"
+          terraform_wrapper: false
+      - name: Destroy everything
+        if: steps.due.outputs.due == 'true'
+        run: scripts/nuke.sh
+      - name: Disable the workflows that would bring it back
+        if: steps.due.outputs.due == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for workflow in plan-apply.yml live-smoke.yml nuke.yml; do
+            gh workflow disable "$workflow" --repo "${{ github.repository }}" || true
+          done

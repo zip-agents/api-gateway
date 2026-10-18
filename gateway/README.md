@@ -207,7 +207,7 @@ used. Without it, the portal offers API-key sign-in only.
   operators sign in with their Cognito admin account, and operator keys, the smoke key
   among them, reach the API only.
 - **The first admin** is created with `make dev-admin EMAIL=...` (locally) or
-  `make aws-admin EMAIL=...` (prod), from the platform repository.
+  the manual commands in the platform's `docs/aws-runbook.md` (prod).
 
 **Locally, with no cloud:** `make up` runs **fake-cognito** (`fake-cognito/` in the platform
 repository) in place of Cognito. It implements the parts of Cognito's contract the
@@ -296,7 +296,7 @@ needs it land in one pull request.
 The gateway runs on on-demand Fargate (the entry point is never reclaimed like Spot), with
 one task of 0.25 vCPU and 0.5 GB, as the load balancer's only target. API keys and the
 session secret come from Secrets Manager (`zip-platform/prod/gateway`, written by the
-platform's `make aws-api-keys`). Upstreams are the zip services' Cloud Map names,
+platform's `docs/aws-runbook.md`, step 4). Upstreams are the zip services' Cloud Map names,
 `<service>.zip.internal:8000`. Behind the load balancer, `X-Forwarded-Proto` and the `Host`
 header give the portal its public URL.
 

@@ -52,6 +52,16 @@ data "aws_iam_policy_document" "trust" {
         : "repo:${var.github_repositories[each.value.name]}:pull_request"
       ]
     }
+    # Deploy roles: only jobs running from main. The `prod` environment's branch rule says
+    # the same in GitHub; this enforces it in AWS even if that rule is missing.
+    dynamic "condition" {
+      for_each = each.value.kind == "deploy" ? [1] : []
+      content {
+        test     = "StringEquals"
+        variable = "token.actions.githubusercontent.com:ref"
+        values   = ["refs/heads/main"]
+      }
+    }
   }
 }
 
@@ -69,10 +79,65 @@ resource "aws_iam_role_policy_attachment" "plan" {
   policy_arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
 }
 
+# ...except other stacks' state. A pull request can change its own workflow, so a plan
+# role must not read another stack's state (the platform's holds the Cognito client
+# secret). Each reads only its own state key, and none reads secret values. (The SSM
+# parameters are IDs and ARNs, not secrets, so plans may read them.)
+locals {
+  state_prefix = {
+    for name in keys(var.github_repositories) :
+    name => name == "platform" ? "platform/" : "services/${name}/"
+  }
+}
+
+data "aws_iam_policy_document" "plan_limits" {
+  for_each = local.state_prefix
+
+  statement {
+    sid           = "OnlyOwnState"
+    effect        = "Deny"
+    actions       = ["s3:GetObject", "s3:GetObjectVersion"]
+    not_resources = ["${aws_s3_bucket.state.arn}/${each.value}*"]
+  }
+  statement {
+    sid       = "NoSecretValues"
+    effect    = "Deny"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "plan_limits" {
+  for_each = data.aws_iam_policy_document.plan_limits
+  name     = "plan-limits"
+  role     = aws_iam_role.github["${each.key}-plan"].id
+  policy   = each.value.json
+}
+
 # --- platform deploy role
 resource "aws_iam_role_policy_attachment" "platform_deploy" {
   role       = aws_iam_role.github["platform-deploy"].name
   policy_arn = "arn:aws:iam::aws:policy/PowerUserAccess"
+}
+
+# PowerUser has no IAM rights. The nuke workflow (scripts/nuke.sh) also removes the
+# services' and the gateway's task roles, so the platform role may read and delete roles
+# named after the cluster, and nothing else in IAM: it cannot create or change a role.
+data "aws_iam_policy_document" "platform_nuke" {
+  statement {
+    sid = "DeleteServiceRoles"
+    actions = [
+      "iam:GetRole", "iam:GetRolePolicy", "iam:ListRolePolicies", "iam:ListAttachedRolePolicies",
+      "iam:ListInstanceProfilesForRole", "iam:DeleteRolePolicy", "iam:DeleteRole",
+    ]
+    resources = ["arn:aws:iam::${local.account_id}:role/${local.cluster_name}-*"]
+  }
+}
+
+resource "aws_iam_role_policy" "platform_nuke" {
+  name   = "nuke-service-roles"
+  role   = aws_iam_role.github["platform-deploy"].id
+  policy = data.aws_iam_policy_document.platform_nuke.json
 }
 
 # --- service deploy roles

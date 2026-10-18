@@ -8,7 +8,7 @@ terraform {
     }
   }
 
-  # Bucket and region come from -backend-config (CI, or the platform's scripts/tf.sh).
+  # Bucket and region come from -backend-config (CI, or by hand: docs/aws-runbook.md).
   backend "s3" {
     key          = "services/gateway/prod.tfstate"
     use_lockfile = true

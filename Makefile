@@ -1,13 +1,9 @@
-# Platform tasks: the local stack, the AWS infrastructure (Terraform), cost controls and CI
-# tooling. Everything runs in containers: the host needs Docker (or ENGINE=podman), plus
+# Platform tasks: the local stack, static checks of the AWS infrastructure (Terraform) and CI
+# tooling. Nothing here talks to AWS: changes to AWS are made by CD (the workflows) or by
+# hand, with the commands in docs/aws-runbook.md. Everything runs in containers: the host needs Docker (or ENGINE=podman), plus
 # `act` for `make act`. The gateway is part of this repository (gateway/). The zip services
 # (claude/, grok/, dsh-qwen3.8/) are separate repositories checked out alongside; this
 # repository only reads them.
-#
-# AWS targets (aws-*) use platform.env (AWS_REGION, AWS_PROFILE); see docs/deployment.md.
-
--include platform.env
-export AWS_REGION AWS_PROFILE
 
 ENGINE ?= docker
 COMPOSE ?= $(ENGINE) compose
@@ -21,9 +17,7 @@ AS_ME := $(if $(ROOTLESS),,--user $(shell id -u):$(shell id -g)) -e HOME=/tmp -e
 .DEFAULT_GOAL := help
 .PHONY: help env lock gateway-check gateway-test gateway-fmt test test-unit test-smoke \
         up down logs smoke perf contract-sync contract-check actions-lint act ci shellcheck \
-        tf-fmt tf-check test-lambda aws-bootstrap aws-plan aws-apply aws-api-keys aws-pause \
-        aws-resume aws-status aws-test-killswitch aws-down aws-nuke \
-        dev-admin fake-cognito-test aws-admin
+        tf-fmt tf-check test-lambda dev-admin fake-cognito-test
 
 help: ## List targets
 	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-16s %s\n", $$1, $$2}'
@@ -131,41 +125,3 @@ dev-admin: ## Create a portal admin in the local fake-cognito (stack up): make d
 fake-cognito-test: ## Contract tests for fake-cognito (boto3, httpx and PyJWT against it)
 	$(ENGINE) build -q --target test -t zip-fake-cognito:test fake-cognito >/dev/null
 	$(ENGINE) run --rm zip-fake-cognito:test
-
-# --------------------------------------------------------------------------- AWS
-
-aws-bootstrap: ## Once, as an administrator: state bucket, CI roles, ECR, budget and kill switch
-	scripts/bootstrap.sh
-
-aws-plan: ## Plan the shared platform (terraform/prod)
-	scripts/tf.sh terraform/prod init -input=false
-	scripts/tf.sh terraform/prod plan
-
-aws-apply: ## Apply the shared platform (terraform/prod); CI does this on merge to main
-	scripts/tf.sh terraform/prod init -input=false
-	scripts/tf.sh terraform/prod apply
-
-aws-admin: ## Create a portal admin in the prod pool (Cognito emails a password): make aws-admin EMAIL=you@example.com
-	scripts/cognito-admin.sh prod $(EMAIL)
-
-aws-api-keys: ## Generate gateway API keys into Secrets Manager: make aws-api-keys NAMES="smoke alice"
-	scripts/api-keys.sh $(or $(NAMES),smoke)
-
-aws-pause: ## Scale every service to 0 (compute and data transfer stop; ~$$2/day fixed remains)
-	scripts/scale.sh pause
-
-aws-resume: ## Scale every service back to its configured count
-	scripts/scale.sh resume
-
-aws-status: ## Desired and running task counts
-	scripts/scale.sh status
-
-aws-test-killswitch: ## Invoke the budget kill switch now (scales everything to 0; undo with aws-resume)
-	scripts/aws.sh lambda invoke --function-name zip-platform-killswitch \
-	  --cli-binary-format raw-in-base64-out --payload '{"test": "manual invocation"}' /dev/stdout
-
-aws-down: ## Destroy every service and the shared platform (keeps bootstrap: ~$$1/month)
-	scripts/teardown.sh down
-
-aws-nuke: ## Destroy everything, bootstrap included (after the interview)
-	scripts/teardown.sh nuke

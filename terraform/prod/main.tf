@@ -153,7 +153,7 @@ resource "aws_service_discovery_private_dns_namespace" "main" {
 
 # ------------------------------------------------------------------------- gateway secret
 
-# Values are written by `make api-keys` (scripts/api-keys.sh), never by Terraform, so they
+# Values are written by hand (docs/aws-runbook.md, step 4), never by Terraform, so they
 # never appear in state. The gateway refuses to start until GATEWAY_API_KEYS is set.
 resource "aws_secretsmanager_secret" "gateway" {
   name                    = "${local.project}/${local.environment}/gateway"

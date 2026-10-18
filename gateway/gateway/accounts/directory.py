@@ -1,7 +1,7 @@
 """User accounts in Cognito: the only writes the gateway makes there.
 
 Self sign-up is off in the user pool, so accounts are created only here, when someone
-redeems an invite code, and by `make aws-admin` for admins. The account gets the password
+redeems an invite code, and by the runbook's admin commands (docs/aws-runbook.md) for admins. The account gets the password
 its owner chose on /account/join: AdminCreateUser with no email (MessageAction=SUPPRESS),
 then AdminSetUserPassword as permanent. If the password is refused, the half-made account
 is deleted again, so the email address is not left stuck. Disabling a user also signs

@@ -16,6 +16,9 @@ coverage.xml
 /dsh-qwen3.8/
 
 # Terraform working files. State lives in S3; lock files (.terraform.lock.hcl) are committed.
+# The bootstrap's variables hold your alert email; the repository is public. (The prod
+# stack's terraform.tfvars is committed: CI reads it, and it holds no secrets.)
+/terraform/bootstrap/terraform.tfvars
 .terraform/
 *.tfstate
 *.tfstate.*

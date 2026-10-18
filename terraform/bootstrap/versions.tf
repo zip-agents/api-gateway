@@ -13,7 +13,7 @@ terraform {
   }
 
   # The bucket is created by this stack, so the first apply runs with local state
-  # (scripts/bootstrap.sh adds a local_override.tf) and then migrates into it. The bucket
+  # (docs/aws-runbook.md adds a local_override.tf) and then migrates into it. The bucket
   # name and region are passed with -backend-config.
   backend "s3" {
     key          = "bootstrap.tfstate"

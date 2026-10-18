@@ -41,13 +41,17 @@ A registered `.com` domain adds about $14/year.
    - 50% and 80% of actual spend: email
    - 100% of forecast spend: email
    - 100% of actual spend: email, and the **kill switch**. This Lambda scales every
-     service to zero, which stops compute and data transfer. The load balancer and NAT
-     keep running, at ~$2.2/day, until `make aws-down`. Restore with `make aws-resume`.
-   - `make aws-test-killswitch` triggers it by hand, to check it works.
+     service to zero, which stops compute and data transfer at once. The load balancer
+     and NAT keep running, at ~$2.2/day, until the `nuke` workflow's next daily check
+     sees the budget is spent and destroys them.
+   - The runbook (`docs/aws-runbook.md`, step 6) has the command that fires it by hand.
 
-   The budget and kill switch are in the bootstrap stack, so they survive `make aws-down`.
-5. **Switching off:** `make aws-pause`, `make aws-down` and `make aws-nuke`
-   (docs/deployment.md).
+   The budget and kill switch are in the bootstrap stack, which the nuke leaves in place
+   (it costs nothing).
+5. **The nuke** (`.github/workflows/nuke.yml`): a daily check that destroys everything
+   that costs money once the date in `NUKE_AFTER` passes, or once the budget is spent.
+   It then disables the workflows that would recreate the platform, so a forgotten
+   deployment can't keep costing money.
 
 ## Not a true hard cap
 

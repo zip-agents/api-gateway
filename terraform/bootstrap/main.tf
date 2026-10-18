@@ -1,5 +1,5 @@
 # Account-level foundations, applied once from an administrator's machine
-# (`make bootstrap`). Everything else is deployed by CI with the roles defined here.
+# (docs/aws-runbook.md). Everything else is deployed by CI with the roles defined here.
 
 data "aws_caller_identity" "current" {}
 

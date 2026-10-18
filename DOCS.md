@@ -108,42 +108,26 @@ of the stack keeps working.
 
 ## Deploying to AWS
 
-The full walkthrough is [docs/deployment.md](docs/deployment.md). In short:
+Nothing in the Makefile talks to AWS. Changes reach AWS through CD (the workflows) or
+through the manual commands in [docs/aws-runbook.md](docs/aws-runbook.md). The overview
+and the GitHub setup are in [docs/deployment.md](docs/deployment.md). In short:
 
-```bash
-cp platform.env.example platform.env      # AWS_REGION, AWS_PROFILE
-cp terraform/bootstrap/terraform.tfvars.example terraform/bootstrap/terraform.tfvars
-cp terraform/prod/terraform.tfvars.example terraform/prod/terraform.tfvars
-
-make aws-bootstrap                        # once, as an administrator
-make aws-apply                            # the shared platform (CI does this on merge afterwards)
-make aws-api-keys NAMES="smoke you"       # operator API keys; printed once
-make aws-admin EMAIL=you@example.com      # your portal admin; Cognito emails a temporary password
-```
-
-1. Set up GitHub: the environment, variables and secrets listed in deployment.md.
-2. Merge to `main`. `plan-apply` applies the platform, then deploys the gateway.
-3. Merge to `main` in each zip-service repository, which deploys itself.
-4. Sign in at `https://<domain>/account/login` with the emailed password, choose your
+1. By hand, once (runbook steps 2–5): the bootstrap stack, the platform, the operator
+   API keys and your portal admin.
+2. In GitHub: the `prod` environment (main only), the variables and the secrets listed in
+   deployment.md, including `NUKE_AFTER`.
+3. Merge to `main`. `plan-apply` applies the platform, then deploys the gateway.
+4. Merge to `main` in each zip-service repository, which deploys itself.
+5. Sign in at `https://<domain>/account/login` with the emailed password, choose your
    own, and create invite codes on Admin → Invites.
 
 In prod, operator keys (the smoke key among them) reach the API only. Portal sign-in is
 Cognito only (`GATEWAY_ALLOW_KEY_LOGIN=false`).
 
-### Running it day to day
-
-| Command | Effect |
-|---|---|
-| `make aws-status` | Desired and running task counts |
-| `make aws-pause` / `make aws-resume` | Scale every service to 0 and back (~$2.2/day fixed while paused) |
-| `make aws-api-keys NAMES="..."` | Replace the operator key list and restart the gateway |
-| `make aws-plan` | Plan the shared platform |
-| `make aws-test-killswitch` | Fire the budget kill switch now (undo with `aws-resume`) |
-| `make aws-down` | Destroy the services and the platform; bootstrap stays (~$1/month) |
-| `make aws-nuke` | Destroy everything, bootstrap included |
-
-After `aws-down`, run `aws-apply`, `aws-api-keys` and `aws-admin` again. The pool and the
-database were destroyed, so every account, invite and user key is gone.
+**Switching off:** the `nuke` workflow destroys everything that costs money once the
+date in `NUKE_AFTER` passes or the month's spend reaches the budget, then disables the
+workflows that would bring it back. It can also be run by hand. Pausing, keys and the
+other day-to-day commands are in the runbook.
 
 ## Costs
 

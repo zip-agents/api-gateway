@@ -16,8 +16,8 @@ Nothing else.
 
 | Repository | Owns | Deployed by |
 |---|---|---|
-| **zip-platform** (this one) | `terraform/bootstrap` (state, CI roles, ECR, budget, kill switch), `terraform/prod` (network, load balancer, DNS, certificate, cluster, Cloud Map, Cognito, Aurora, secrets), `terraform/modules/*`, and the **gateway** (`gateway/`, with its stack in `gateway/deploy`) | an administrator once (`make aws-bootstrap`), then `plan-apply.yml` on merge: the platform first, then the gateway, each only if it changed |
-| **zip-claude**, **zip-grok**, **zip-dsh** | their service, and `deploy/`, which calls the platform's `ecs-service` module at a release tag | their own `deploy.yml`, after their CI passes on `main` |
+| **zip-agents/api-gateway** (this one) | `terraform/bootstrap` (state, CI roles, ECR, budget, kill switch), `terraform/prod` (network, load balancer, DNS, certificate, cluster, Cloud Map, Cognito, Aurora, secrets), `terraform/modules/*`, and the **gateway** (`gateway/`, with its stack in `gateway/deploy`) | an administrator once, by hand ([aws-runbook.md](aws-runbook.md)), then `plan-apply.yml` on merge: the platform first, then the gateway, each only if it changed |
+| **zip-agents/claude-code**, **grok-build**, **dsh-qwen-flash-next** | their service, and `deploy/`, which calls the platform's `ecs-service` module at a release tag | their own `deploy.yml`, after their CI passes on `main` |
 
 The platform hands its outputs to the services as SSM parameters
 (`/zip-platform/prod/...`). A service reads parameters, never another stack's state, so
@@ -30,7 +30,7 @@ one implementation of the same contract, with its own history and CI.
 
 On disk the zip-service repositories sit side by side inside this one, each in its own
 directory (`claude/`, `grok/`, `dsh-qwen3.8/`), which this repository's `.gitignore`
-excludes. `docker compose` and `make aws-down` rely on that layout.
+excludes. `docker compose` relies on that layout.
 
 ## First-time setup
 
@@ -42,29 +42,21 @@ excludes. `docker compose` and `make aws-down` rely on that layout.
 2. **Register the domain:** in Route 53, go to Registered domains → Register. This costs
    about $14/year for `.com`, and creates the hosted zone. Confirm the registrant email.
 
-### On your machine
+### By hand, once
 
-All you need is Docker. Every tool runs in a container.
-
-```bash
-cp platform.env.example platform.env                          # AWS_REGION, AWS_PROFILE
-cp terraform/bootstrap/terraform.tfvars.example terraform/bootstrap/terraform.tfvars
-cp terraform/prod/terraform.tfvars.example terraform/prod/terraform.tfvars
-# edit both tfvars: region, alert email, owner/name of the four repositories, domain
-
-make aws-bootstrap      # state bucket, OIDC + roles, ECR, $100 budget and kill switch
-                        # then click the confirmation link AWS emails you (alerts)
-make aws-apply          # the shared platform (first time from here; CI afterwards),
-                        # including the Cognito pool and the Aurora accounts database
-make aws-api-keys NAMES="smoke you"     # prints the keys once: keep them
-make aws-admin EMAIL=you@example.com    # your portal admin account; Cognito emails a password
-```
+Nothing in the Makefile talks to AWS. Follow [aws-runbook.md](aws-runbook.md) steps 1–5:
+tools and credentials, the bootstrap stack (then confirm the alert email AWS sends), the
+platform, the operator API keys (the gateway won't start without them), and your portal
+admin.
 
 ### In GitHub
 
 1. Create the four repositories and push each one.
-2. In **each** repository, create an environment named `prod`. Add yourself as a required
-   reviewer if deploys should wait for approval.
+2. In **each** repository, create an environment named `prod`. Under **Deployment
+   branches and tags**, allow only `main`: the deploy roles trust any job that runs in
+   `prod`, so without this rule a workflow started on another branch could deploy (for
+   the platform, with PowerUser rights). Add yourself as a required reviewer if deploys
+   should wait for approval.
 3. Set repository variables:
 
    | Variable | Where | Value |
@@ -74,19 +66,24 @@ make aws-admin EMAIL=you@example.com    # your portal admin account; Cognito ema
    | `CLAUDE_REPOSITORY`, `GROK_REPOSITORY`, `DSH_REPOSITORY` | platform | `owner/name`, for the manual `integration` workflow (the whole stack on a runner) |
    | `SMOKE_SERVICES` | platform | `claude,grok,dsh`: the services the live smoke test covers |
 
+   | `NUKE_AFTER` | platform | the date the `nuke` workflow destroys everything, `YYYY-MM-DD` |
+
 4. Set the secret `SMOKE_API_KEY` (the `smoke` key) in all four repositories. If the
    repositories are private, also give the platform repository a fine-grained read-only
    token as `REPOS_READ_TOKEN`.
-5. In every zip service's `deploy/main.tf`, replace `OWNER` in the module source. Then
-   tag the platform repository, `git tag v1.0.0 && git push --tags`, which the services
-   pin. Private repositories also need a token for `git::https` module downloads. (The
-   gateway uses the module by relative path, so it needs no tag.)
+5. In every zip service's `deploy/main.tf`, the module source must name
+   `github.com/zip-agents/api-gateway.git`. Then tag this repository,
+   `git tag v1.0.0 && git push --tags`, which the services pin. The repositories are
+   public, so `git::https` module downloads need no token. (The gateway uses the module
+   by relative path, so it needs no tag.)
 
 ### First deploy
 
 1. Merge to `main` here. `plan-apply` applies the platform, runs the gateway checks, then
    deploys the gateway: push the image, `terraform apply`, and a post-deploy check.
-   Then merge to `main` in **claude** and **grok**, which deploy themselves the same way.
+   Then merge to `main` in **claude**, **grok** and **dsh**, which deploy themselves the
+   same way. Do this only after the gateway is up: their post-deploy check goes through
+   it.
 2. Open `https://<domain>` and sign in with your admin account. Create invite
    codes on Admin → Invites. Zip a large file once on `/zip`: `live-smoke` can't cover
    the browser upload on AWS, since operator-key sign-in is off there.
@@ -109,27 +106,28 @@ make aws-admin EMAIL=you@example.com    # your portal admin account; Cognito ema
 - **Changing the module:** the gateway picks it up in the same pull request. For the zip
   services, release a new tag of this repository, then bump `?ref=` in each one when it is
   ready. They move independently.
-- **API keys:** `make aws-api-keys NAMES="smoke alice"` replaces the key list and
-  restarts the gateway.
+- **API keys:** add or remove one operator key by hand ([aws-runbook.md](aws-runbook.md),
+  step 4). The others, and every portal session, are unaffected.
 - **Logs:** CloudWatch log groups `/zip-platform/prod/<service>`, JSON lines. Follow one
   request across the gateway and a service in Logs Insights with
   `filter request_id = "<id>"`.
 
 ## Switching it off
 
-| Command | Effect | Cost while off |
-|---|---|---|
-| `make aws-pause` | every service scaled to 0; `make aws-resume` restores them | ~$2.2/day (ALB, NAT) |
-| `make aws-down` | destroys every service stack and `terraform/prod` | ~$1/month (state, ECR images, zone) |
-| `make aws-nuke` | `aws-down`, then the bootstrap stack too | the domain only (~$14/year, turn off auto-renew) |
+The `nuke` workflow destroys everything that costs money ([scripts/nuke.sh](../scripts/nuke.sh)):
+the zip services, the gateway, the whole of `terraform/prod` and every image in ECR. It
+checks once a day and runs when the date in `NUKE_AFTER` has passed, or when the month's
+actual spend has reached the budget (the kill switch has already scaled everything to 0
+by then). It can be run by hand from the Actions tab too. Afterwards it disables
+`plan-apply`, `live-smoke` and itself, so nothing brings the platform back; service
+deploys fail harmlessly, since the parameters they read are gone.
 
-- **Coming back after `aws-down`:** run `make aws-apply`, then `make aws-api-keys`. The
-  secret is recreated empty, and the gateway won't start without keys. Then
-  `make aws-admin EMAIL=...`: the user pool and the database were destroyed too, so every
-  account, invite and user key is gone. Then redeploy by hand, gateway first: `plan-apply`
-  with target `gateway` here, then each zip service's `deploy` workflow.
-- **After `aws-nuke`:** the script prints the two remaining manual steps. Turn off domain
-  auto-renew, and delete the hosted zone with one CLI command.
+What it leaves costs nothing, or almost nothing: the bootstrap stack (state bucket, empty
+ECR repositories, roles, budget, kill switch), the Route 53 zone ($0.50/month) and the
+domain. [aws-runbook.md](aws-runbook.md), step 7, removes those by hand.
+
+To pause instead (everything to 0 tasks, ~$2.2/day for the load balancer and NAT), see
+the runbook, step 6.
 
 ## Cost controls
 
@@ -139,7 +137,7 @@ is no true hard cap on AWS.
 ## Adding a service
 
 1. Add it to `github_repositories` in `terraform/bootstrap/terraform.tfvars`, then
-   `make aws-bootstrap` (its ECR repository and roles).
+   apply the bootstrap stack by hand (its ECR repository and roles).
 2. Add its `deploy/` stack and `deploy.yml` to its repository (copy a zip service's).
 3. Add it to the gateway's `GATEWAY_UPSTREAMS` in `gateway/deploy/main.tf`.
 
@@ -153,7 +151,8 @@ code from an admin (see the gateway README, "Accounts and sign-in").
   client for the gateway. Its IDs are published as SSM parameters
   (`/zip-platform/prod/cognito_*`); the client secret goes into Secrets Manager
   (`zip-platform/prod/cognito`), so it is also in this stack's encrypted state.
-- **The first admin:** after `make aws-apply`, run `make aws-admin EMAIL=you@example.com`.
+- **The first admin:** after the platform is applied, create it by hand
+  ([aws-runbook.md](aws-runbook.md), step 5).
   Cognito emails a temporary password; sign in at `https://<domain>/account/login` and
   choose your own. Then create invite codes on `/account/admin/invites`.
 - **Locally:** no AWS at all. `make up` includes **fake-cognito**, a local stand-in that
@@ -162,7 +161,7 @@ code from an admin (see the gateway README, "Accounts and sign-in").
   `make dev-admin EMAIL=you@example.com` creates an admin with the real AWS CLI; the
   emails Cognito would send are at `http://localhost:9229/outbox`. Real Cognito is first
   exercised on AWS, by the rehearsal.
-- **Teardown:** the prod pool goes with `make aws-down`, and with it every account and
+- **Teardown:** the prod pool goes with the nuke, and with it every account and
   invite. That is intended: nothing outlives the interview.
 - **The database:** `terraform/prod/database.tf`. Aurora PostgreSQL Serverless v2, one
   instance in the private subnets, reachable only from the gateway's security group,

@@ -1,5 +1,5 @@
 # Accounts for the portal: the Cognito user pool (invite-only; see modules/cognito-pool).
-# The pool, its users and their invites are destroyed with this stack (`make aws-down`).
+# The pool, its users and their invites are destroyed with this stack (the nuke workflow).
 
 data "aws_caller_identity" "current" {}
 

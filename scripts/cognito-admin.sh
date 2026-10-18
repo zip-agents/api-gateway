@@ -1,31 +1,25 @@
 #!/usr/bin/env bash
-# Create an admin account in a Cognito pool: Cognito emails a temporary password, and the
-# account joins the "admin" group (invite codes, users and keys in the portal).
+# Create an admin account in the local fake-cognito (make up first): it "emails" a
+# temporary password to its outbox, and the account joins the "admin" group (invite codes,
+# users and keys in the portal). The AWS CLI calls are the same ones docs/aws-runbook.md
+# runs by hand against the real pool.
 #
-#   scripts/cognito-admin.sh dev  you@example.com   the local fake-cognito (make up first)
-#   scripts/cognito-admin.sh prod you@example.com   the pool from terraform/prod
+#   scripts/cognito-admin.sh dev you@example.com
 #
 # Safe to re-run: an existing account is just added to the group.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENGINE="${ENGINE:-docker}"
-aws() { "$ROOT/scripts/aws.sh" "$@"; }
-pool="${1:?usage: cognito-admin.sh dev|prod <email>}"
-email="${2:?usage: cognito-admin.sh dev|prod <email>}"
+pool="${1:?usage: cognito-admin.sh dev <email>}"
+email="${2:?usage: cognito-admin.sh dev <email>}"
 [[ "$email" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || { echo "not an email: $email" >&2; exit 1; }
 email="$(printf '%s' "$email" | tr '[:upper:]' '[:lower:]')"
 
-case "$pool" in
-  dev)
-    # The same AWS CLI calls, against fake-cognito on the compose network.
-    pool_id="eu-west-2_LocalDev1"
-    aws() { (cd "$ROOT" && "$ENGINE" compose --profile tools run --rm -T aws-cli "$@"); } ;;
-  prod)
-    pool_id="$(aws ssm get-parameter --name /zip-platform/prod/cognito_user_pool_id \
-      --query Parameter.Value --output text </dev/null | tr -d '\r')" ;;
-  *) echo "usage: cognito-admin.sh dev|prod <email>" >&2; exit 1 ;;
-esac
+[ "$pool" = dev ] || { echo "usage: cognito-admin.sh dev <email> (prod: docs/aws-runbook.md)" >&2; exit 1; }
+# The AWS CLI, against fake-cognito on the compose network.
+pool_id="eu-west-2_LocalDev1"
+aws() { (cd "$ROOT" && "$ENGINE" compose --profile tools run --rm -T aws-cli "$@"); }
 
 # An existing account is only promoted if its email was proven by Cognito (an account this
 # script created). Anyone with an invite code can join under any address, unverified: an
@@ -41,7 +35,7 @@ if existing="$(aws cognito-idp admin-get-user --user-pool-id "$pool_id" --userna
    (email verified: ${verified:-no}; joined with invite: ${invite:-no}).
    Whoever joined with an invite code chose that address without proving they own it,
    so making it an admin could hand admin rights to someone else. Check who it is on
-   Admin -> Users. To promote it anyway: FORCE=1 make ${pool/prod/aws}-admin EMAIL=$email
+   Admin -> Users. To promote it anyway: FORCE=1 make dev-admin EMAIL=$email
 MSG
     exit 1
   fi
@@ -55,6 +49,4 @@ fi
 aws cognito-idp admin-add-user-to-group --user-pool-id "$pool_id" --username "$email" \
   --group-name admin </dev/null
 echo "== $email is an admin of $pool_id. Sign in to the portal; it asks for a new password the first time."
-if [ "$pool" = dev ]; then
-  echo "== The temporary password is in fake-cognito's outbox: http://localhost:${FAKE_COGNITO_PORT:-9229}/outbox"
-fi
+echo "== The temporary password is in fake-cognito's outbox: http://localhost:${FAKE_COGNITO_PORT:-9229}/outbox"

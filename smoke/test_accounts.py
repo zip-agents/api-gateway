@@ -97,7 +97,7 @@ def test_invite_sign_in_key_and_admin_pages() -> None:
     run = uuid.uuid4().hex[:8]
     admin_email, guest_email = f"admin-{run}@example.com", f"guest-{run}@example.com"
 
-    # An admin, created the way `make dev-admin` (and `make aws-admin` on AWS) does it.
+    # An admin, created the way `make dev-admin` (and the runbook's commands on AWS) does it.
     created = admin_api("AdminCreateUser", {
         "Username": admin_email,
         "UserAttributes": [{"Name": "email", "Value": admin_email},
