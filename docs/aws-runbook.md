@@ -31,7 +31,8 @@ the bucket.
 
 ```bash
 cp terraform/bootstrap/terraform.tfvars.example terraform/bootstrap/terraform.tfvars
-# edit it: region, alert email, budget (gitignored: it holds your email)
+# edit it: region, alert email, budget, and the repositories as owner@id/name@id
+# (the IDs GitHub puts in its OIDC subject; see variables.tf). Gitignored: it holds your email.
 printf 'terraform {\n  backend "local" {}\n}\n' > terraform/bootstrap/local_override.tf
 terraform -chdir=terraform/bootstrap init
 terraform -chdir=terraform/bootstrap apply

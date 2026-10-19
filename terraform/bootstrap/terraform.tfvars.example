@@ -2,14 +2,15 @@
 region      = "eu-west-2"
 alert_email = "you@example.com"
 
-# owner/name of the repository each service deploys from. The keys name the services.
+# The repository each service deploys from, as GitHub's OIDC subject names it: here
+# owner@id/name@id (see the variable's description). The keys name the services.
 # The gateway lives in the platform repository, so both point at it.
 github_repositories = {
-  platform = "zip-agents/api-gateway"
-  gateway  = "zip-agents/api-gateway"
-  claude   = "zip-agents/claude-code"
-  grok     = "zip-agents/grok-build"
-  dsh      = "zip-agents/dsh-qwen-flash-next"
+  platform = "zip-agents@344538022/api-gateway@1424863310"
+  gateway  = "zip-agents@344538022/api-gateway@1424863310"
+  claude   = "zip-agents@344538022/claude-code@1424861958"
+  grok     = "zip-agents@344538022/grok-build@1424861023"
+  dsh      = "zip-agents@344538022/dsh-qwen-flash-next@1424859429"
 }
 
 monthly_budget_usd = 100
