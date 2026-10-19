@@ -2,12 +2,16 @@
 
 ## Summary of findings
 * Planning is the most important part, and even if you explain to the agent what you want, you still need to double check the final plan it comes up with
-* Don't be afraid to push back and question the agent, all agents tried to roll their own zip code because they were overzealously interpreting the spec. Question them about why they made certain decisions
+* Don't be afraid to push back and question the agent, all agents tried to roll their own zip code, because my spec demanded Zip64 without saying why. Question them about why they made certain decisions, and give them the intent behind requirements, not just the rules
 * Don't just blindly trust their results, or their tests, test yourself
-  * the Grok implementation is 12x slower than the others, because it adds a wait in its buffer, neither opus or qwen flash did this
+  * the Grok implementation is 12x slower than the others: when its hand-off queue to the compression thread is full, it sleeps a fixed 100 ms instead of waiting for room. Claude's doesn't do this; DSH's only sleeps 5 ms, so it barely matters
   * Qwen Flash made some odd choices based on incorrect assumptions it made, it made an incorrect assumption about the stdlib zipfile
-    * it asserted that it could not stream compressed data due to not being able to seek backwards. This is plain wrong, this resulted in an extra dependency. 
-    * this resulted in its design being a bit difficult to follow. Truth be told I primarily looked at Claude's code, for Grok and Qwen I only really skimmed.
+    * it asserted that it could not stream compressed data due to not being able to seek backwards. This is plain wrong, this resulted in an extra dependency, and a hack to set file timestamps. 
+    * this resulted in its design being a bit difficult to follow.
+  * DSH's plan-and-journal process made it the most reviewable of the three: the journal is how I found its false claim
+  * I deliberately left both issues in place, Grok's 12x slower performance and Qwen's choice of zip library, rather than fixing them myself or asking the agents to. The point is an honest comparison of what each model produced, not to make one the reference and fix the others to match
+* Truth be told I primarily looked at Claude's code, for Grok and Qwen I only really skimmed.
+* Getting the local model running took a day and a half. Once it ran, DSH built the service in about the same time as the others
 * This was fun, I went beyond the brief purely for that reason!
 
 ## The brief
@@ -21,7 +25,7 @@ Broadly it is to do the following:
 * create a CI/CD pipeline, GitHub actions is recommended but it is left up to me to decide what and how.
 
 Disclaimer: I included a front end so that it could easily be tested via the browser, but it's not polished. It's just there to conveniently test the microservices via the browser.
-Also, please give the gateway time to wake up, the db will be starting cold if it's not been used within a 15 minute window.
+Also, the first sign-in or account page after a quiet spell can take 15–30 seconds while the database wakes from idle (it pauses after about 15 minutes without use). If it times out, reload.
 
 ## Repositories
 All in the [zip-agents](https://github.com/zip-agents) GitHub organisation, live at https://zip-agents.com.
