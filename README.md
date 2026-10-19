@@ -8,6 +8,7 @@
   * Qwen Flash made some odd choices based on incorrect assumptions it made, it made an incorrect assumption about the stdlib zipfile
     * it asserted that it could not stream compressed data due to not being able to seek backwards. This is plain wrong, this resulted in an extra dependency. 
     * this resulted in its design being a bit difficult to follow. Truth be told I primarily looked at Claude's code, for Grok and Qwen I only really skimmed.
+* This was fun, I went beyond the brief purely for that reason!
 
 ## The brief
 This was part of a take home coding exercise, of which the use of AI was explicitly required.
@@ -18,6 +19,8 @@ Broadly it is to do the following:
 * build a FastAPI endpoint that accepts files in a single request, zips them up and returns them in the response
 * containerise the service via Docker
 * create a CI/CD pipeline, GitHub actions is recommended but it is left up to me to decide what and how.
+
+Disclaimer: I included a front end so that it could easily be tested via the browser, but it's not polished. It's just there to conventiently test the microservices via the browser. 
 
 ## Repositories
 All in the [zip-agents](https://github.com/zip-agents) GitHub organisation, live at https://zip-agents.com.
