@@ -20,7 +20,8 @@ Broadly it is to do the following:
 * containerise the service via Docker
 * create a CI/CD pipeline, GitHub actions is recommended but it is left up to me to decide what and how.
 
-Disclaimer: I included a front end so that it could easily be tested via the browser, but it's not polished. It's just there to conventiently test the microservices via the browser. 
+Disclaimer: I included a front end so that it could easily be tested via the browser, but it's not polished. It's just there to conveniently test the microservices via the browser.
+Also, please give the gateway time to wake up, the db will be starting cold if it's not been used within a 15 minute window.
 
 ## Repositories
 All in the [zip-agents](https://github.com/zip-agents) GitHub organisation, live at https://zip-agents.com.
