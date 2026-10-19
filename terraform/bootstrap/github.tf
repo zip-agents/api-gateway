@@ -52,16 +52,11 @@ data "aws_iam_policy_document" "trust" {
         : "repo:${var.github_repositories[each.value.name]}:pull_request"
       ]
     }
-    # Deploy roles: only jobs running from main. The `prod` environment's branch rule says
-    # the same in GitHub; this enforces it in AWS even if that rule is missing.
-    dynamic "condition" {
-      for_each = each.value.kind == "deploy" ? [1] : []
-      content {
-        test     = "StringEquals"
-        variable = "token.actions.githubusercontent.com:ref"
-        values   = ["refs/heads/main"]
-      }
-    }
+    # Deploy roles run from main only because each repository's `prod` environment allows
+    # only `main` (Settings -> Environments -> Deployment branches): GitHub won't start a
+    # `prod` job from another branch, and only `prod` jobs get this subject. IAM can't
+    # check the branch itself: for GitHub tokens it only evaluates `aud` and `sub`, so a
+    # condition on `ref` never matches and blocks every login.
   }
 }
 
