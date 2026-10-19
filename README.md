@@ -1,5 +1,14 @@
 # Comparing coding agents.
 
+## Summary of findings
+* Planning is the most important part, and even if you explain to the agent what you want, you still need to double check the final plan it comes up with
+* Don't be afraid to push back and question the agent, all agents tried to roll their own zip code because they were overzealously interpreting the spec. Question them about why they made certain decisions
+* Don't just blindly trust their results, or their tests, test yourself
+  * the Grok implementation is 12x slower than the others, because it adds a wait in its buffer, neither opus or qwen flash did this
+  * Qwen Flash made some odd choices based on incorrect assumptions it made, it made an incorrect assumption about the stdlib zipfile
+    * it asserted that it could not stream compressed data due to not being able to seek backwards. This is plain wrong, this resulted in an extra dependency. 
+    * this resulted in its design being a bit difficult to follow. Truth be told I primarily looked at Claude's code, for Grok and Qwen I only really skimmed.
+
 ## The brief
 This was part of a take home coding exercise, of which the use of AI was explicitly required.
 The logic behind this is that such tools are now commonplace and increasingly developers need to be competent with them.
@@ -18,7 +27,7 @@ All in the [zip-agents](https://github.com/zip-agents) GitHub organisation, live
 | [api-gateway](https://github.com/zip-agents/api-gateway) | this repo: the gateway, the shared AWS platform (Terraform), local compose stack, smoke and performance tests |
 | [claude-code](https://github.com/zip-agents/claude-code) | the zip service written by Claude Code (Opus 5.5) |
 | [grok-build](https://github.com/zip-agents/grok-build) | the zip service written by Grok Build (4.7) |
-| [dsh-qwen-flash-next](https://github.com/zip-agents/dsh-qwen-flash-next) | the zip service written by dsh with Qwen 3.8 Flash Next, running locally |
+| [dsh-qwen-flash-next](https://github.com/zip-agents/dsh-qwen-flash-next) | the zip service written by DeepSeek Harness (DSH) with Qwen 3.8 Flash Next, running locally |
 
 ## My initial approach
 First thing was to research how FastAPI handles file uploads and the fine details of zipping files.
@@ -105,7 +114,7 @@ This prompt was given at the plan stage to give the models a chance to ask any q
 The agents:
 * claude code (opus 5.5)
 * grok build (4.7)
-* local dsh with qwen 3.8
+* local DSH with qwen 3.8
 
 Any further questions the agents had were answered by myself as needed
 
@@ -113,6 +122,47 @@ A master docker compose file will be made in the project root. A `make` script w
 
 An API gateway will sit in front of these services, treating them as microservices routing to their endpoints via prepending them with the service name.
 For example `/claude/api/v1/zip`. This will require an api token to use
+
+## How I ran the agents
+None of the agents ran directly on my machine. Each worked in its own sandbox, with only its project folder shared, so an agent could read and change its own code and nothing else. How the sandboxes worked changed part way through, because the first setup made the development loop painful.
+
+### At the start: containers that couldn't run containers
+* **Claude Code and Grok Build** each ran in their own podman container (`claude-box`, `grok-box`), with GPU access where needed.
+* **DSH** (driving the local Qwen model) also ran in a podman container (`dsh-shell`). It was looser than I'd like: it shared the host's network completely (`--network=host`), ran with seccomp disabled, fetched its MCP servers from npm on every start (`npx -y`, no version pinning), kept its state inside the project folder (which broke on drives without symlink support), and kept DeepSeek's defaults, including its search provider.
+
+The problem was that none of them could run Docker inside their container, and the brief is about containers: building the image, running the smoke test against it, testing CI locally. So every time an agent wanted to check its work, it gave me a command, I ran it on the host, and I pasted the output back. That loop was slow, broke the agent's flow, and made me the bottleneck. DSH made it worse by trying to install binaries in its container to run the tests itself.
+
+### Part way through: a VM per project for DSH
+For DSH I replaced the container with a full virtual machine per project (`dsh-vm`):
+
+* Each project gets its own Lima/QEMU VM, cloned from a base VM with the tooling preinstalled (DSH, MCP servers, Python, Node, Docker), so a new project starts quickly and downloads nothing at session start.
+* **The VM has its own Docker engine**, so the agent builds and runs containers itself without touching the host. This is what removed the copy-and-paste loop.
+* The project folder is the only thing shared from the host, mounted at `/workspace`. Home directories, the SSH agent and other projects aren't visible. Credentials live on the VM's own disk, not in the shared folder.
+* The models on the host are reachable from the VM as `host.containers.internal:<port>`.
+* DSH's plugin sets are built once as named profiles and copied whole into each project, so a project never fetches plugins itself. For projects on network drives (e.g. sshfs), `--local-state` keeps DSH's own state on local disk and mounts it into the VM separately, so the project drive holds only code.
+* DSH's configuration: the local Qwen model is the provider, with thinking switchable per conversation; web search uses keyless DuckDuckGo; DeepSeek's own search (which sends queries to DeepSeek's servers) and DeepSeek session logging are disabled.
+
+The split follows trust: Claude Code and Grok Build stay in podman containers; an unaudited agent gets a VM, which is a much stronger boundary than a container that shares the host's kernel.
+
+### Serving the model
+Qwen 3.8 Flash Next runs on the host on vLLM across the 4× RTX 3090s: built from a pinned vLLM commit (`8a728663`) for the 3090s, prefix caching on, launched with Docker, and serving an OpenAI-compatible API on localhost (port 8091 for the tuned lane, 8090 for the standard one). An older oobabooga server is still available on port 5000.
+
+```mermaid
+flowchart LR
+    subgraph Host["Host (4× RTX 3090)"]
+        V["vLLM: Qwen 3.8 Flash Next<br/>:8091 tuned, :8090 standard"]
+        subgraph C["podman containers"]
+            CB["claude-box<br/>Claude Code"]
+            GB["grok-box<br/>Grok Build"]
+        end
+        subgraph VM["dsh-vm (Lima/QEMU, one per project)"]
+            D["DSH"] --> DK["own Docker engine"]
+        end
+        P[("project folders")]
+    end
+    D -->|"host.containers.internal:8091"| V
+    P -. "only its own project, at /workspace" .-> CB & GB & VM
+```
 
 ## Working notes while executing
 Dear reader, please don't expect the following sections to be structured too much. They are my thoughts while implementing the project. More for myself.
@@ -142,7 +192,7 @@ after telling it that we don't want a cli tool, it still kept some of the code a
 told it to add test coverage, grok scored 89%, slightly worse than claude, but acceptable
 
 
-### local dsh and Qwen 3.8
+### local DSH and Qwen 3.8
 planning took alot longer, others were done faster
 had to interupt it regarding its environment. it did do some work arounds and had more capabilities to run commands
 same issues rolling its own zip library, had to intervene. The root cause of why this happens in all three is a fault that lies between the screen and chair.
@@ -152,6 +202,13 @@ ok, this is taking way to long. the other finished literally yesterday, qwen 3.8
 This has literally become the time sink of the project. grok and claude were finished in about 90 min, this is literally taking days. Once I have setup flash, I will see how far it can get in a day. will abandon it after that.
 
 I got flash working, abandoned original qwen stuff, started again with flash.
+
+The following gif summarises how I felt both at the slowness of Qwen 3.8 and the time sink that was getting Flash to a working state:
+
+<p align="center">
+  <img src="images/slow_qwen.gif" alt="GIF: a dog staring at cupcakes on a table, wide-eyed and twitching with impatience" width="320">
+</p>
+
 
 ### The Qwen flash rabbit hole
 Given the slow speeds of Qwen 3.8, I decided to switch to the new next flash version. Its a more powerful model and its much faster.
@@ -169,11 +226,11 @@ In practice once running I achieved ~125 tokens/s I will push the changes I made
 I have tasked claude with coming up with a front end API gateway that all the services can live behind, and I got the agents to generate openapi documentation for their respective microservices. The gateway has to do some modifications when serving the docs such that the urls are `<microservice-name>/api/v1/zip`. It seems to work well. I am also going to add an authentication layer
 
 ### general
-I was not explicit enough that models should give me commands to run, dsh tried to install binaries and such to run tests locally. Long term I need to give it some ability to work with docker images, same with the others. Just for convenience.
+I was not explicit enough that models should give me commands to run, DSH tried to install binaries and such to run tests locally. Long term I need to give it some ability to work with docker images, same with the others. Just for convenience.
 
 told all of them to write makefiles for running unit tests for me
 
-Claude finished planning first, then grok, then much later dsh (expected as locally running, but no usage limits!)
+Claude finished planning first, then grok, then much later DSH (expected as locally running, but no usage limits!)
 all tried to make it dual use as a cli tool, my stupid fault. this resulted in initial flat directory structure which was less readable and poorly organised
 all tried rolling their own zip functionality. The prompt should have explained why we wanted 64 bit, not for the sake of it but for files greater than 4 GiB.
 
@@ -182,25 +239,24 @@ all tried rolling their own zip functionality. The prompt should have explained 
 </p>
 
 
-## What I had to correct, and changing the process for dsh
+## What I had to correct, and changing the process for DSH
 
 ### The same two corrections, in all three
-Every agent needed the same two pushbacks, dsh included, even though it had a written plan:
+Every agent needed the same two pushbacks, DSH included, even though it had a written plan:
 
 1. **Structure.** All three started flat: modules side by side at the top level, and packaged as a CLI tool as well as an API. I had to tell each of them to restructure into submodules by responsibility (API, archive, server or pipeline). Visible in the histories: claude's `2c5068e` "Restructure as an API: main.py entrypoint, packages by responsibility" and grok's `5c4146d` "Lay the API out as a service instead of an installable package". Even after being told, grok kept CLI leftovers (`__main__.py`).
-2. **Rolling their own zip stack.** All three set out to write their own ZIP writer instead of using a library. claude (`02b57c1` "Add streaming Zip64 writer", then `890b6df` "Replace the custom Zip64 writer with stdlib zipfile") and grok (`6099862`, then `9729a01` "... write archives with zipfile") moved to the standard library's `zipfile` once told. dsh moved to a library, but **the wrong one**: it chose `zipstream-ng` because "`ZipFile.open(name, "w")` is STORED-only on 3.12". That is false; I checked, and `zipfile` streams DEFLATE to an output that can't seek. The mistake cost an LGPL dependency, and a hack that replaces the library's `time` module with a per-thread proxy just to set the entries' timestamps, which `zipfile` does with one field.
+2. **Rolling their own zip stack.** All three set out to write their own ZIP writer instead of using a library. claude (`02b57c1` "Add streaming Zip64 writer", then `890b6df` "Replace the custom Zip64 writer with stdlib zipfile") and grok (`6099862`, then `9729a01` "... write archives with zipfile") moved to the standard library's `zipfile` once told. DSH moved to a library, but **the wrong one**: it chose `zipstream-ng` because "`ZipFile.open(name, "w")` is STORED-only on 3.12". That is false; I checked, and `zipfile` streams DEFLATE to an output that can't seek. The mistake cost an LGPL dependency, and a hack that replaces the library's `time` module with a per-thread proxy just to set the entries' timestamps, which `zipfile` does with one field.
 
-The cause of both is the prompt, not the models. It said "every entry MUST be written with Zip64 extensions" without saying why (files over 4 GiB). Read literally, the standard library doesn't do that: it puts Zip64 in the local header only. So writing their own was a reasonable reading of what I wrote. dsh's prompt even said "you may write it yourself (it isn't large)". The flat CLI layout came from similar ambiguity about what was being built. The lesson: **give the intent behind a requirement, not just the requirement.**
+The cause of both is the prompt, not the models. It said "every entry MUST be written with Zip64 extensions" without saying why (files over 4 GiB). Read literally, the standard library doesn't do that: it puts Zip64 in the local header only. So writing their own was a reasonable reading of what I wrote. DSH's prompt even said "you may write it yourself (it isn't large)". The flat CLI layout came from similar ambiguity about what was being built. The lesson: **give the intent behind a requirement, not just the requirement.**
 
-### dsh: a plan first, then a journal
-For claude and grok I used each tool's plan mode: I reviewed the plan, then they built (both kept a `PLAN.md`). For dsh I changed the process to give the agent more structure: a long-running local model has to stay on track over many hours and pick up again after interruptions. The prompt made the agent:
+### DSH: a plan first, then a journal
+For claude and grok I used each tool's plan mode: I reviewed the plan, then they built (both kept a `PLAN.md`). For DSH I changed the process to give the agent more structure: a long-running local model has to stay on track over many hours and pick up again after interruptions. The prompt made the agent:
 
 * **write `PLAN.md` and commit it before any code**: goal and success criteria, environment facts it had verified, the repository layout, library decisions with reasons, the architecture of one request, assumptions where the contract is silent, the order of work with the riskiest parts first, and the verification commands
 * **keep a journal as it goes**, not at the end: `journal/INDEX.md` with one row per task and its status, and one file per task (`journal/01-project-skeleton.md` ... `13-documentation-conformance.md`) with what it did, the decisions and why, and the checks it ran with their results
 * **update the plan when it changes**, and say why in the journal
 
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
 flowchart LR
     P["PROMPT.md<br/>(contract + process)"] --> PL["PLAN.md<br/>committed before any code"]
     PL --> T["next task"]
@@ -221,7 +277,7 @@ flowchart LR
 * Drift: the plan's layout lists modules that were never written (`lifecycle.py`, `problems.py`, `pipeline/state.py`, ...), the logic went elsewhere, and neither the plan nor the journal says so. Docstrings still refer to `pipeline/state.py`.
 * It still started flat and still tried to roll its own zip writer (above). The structure has to be in the prompt; the process alone doesn't supply it.
 
-Overall dsh had the most disciplined process and the most reviewable output of the three, and its speed ended up close to claude's. I'd use the plan-and-journal approach again for any long-running or local agent, and I'd add one thing: a step that checks each "verified" claim in the plan, by a test or by me.
+Overall DSH had the most disciplined process and the most reviewable output of the three, and its speed ended up close to claude's. I'd use the plan-and-journal approach again for any long-running or local agent, and I'd add one thing: a step that checks each "verified" claim in the plan, by a test or by me.
 
 ### grok is slower, and only manual testing caught it
 All three pass the same contract tests and smoke tests. grok is still about **12× slower** than claude on a large file, and takes **38 s for 500 small files** where claude takes 0.1 s. I only noticed when I used the portal in a browser and grok's zips were obviously slower. I then wrote `make perf` (`perf/bench.py`) to measure it:
@@ -243,7 +299,6 @@ The fix is small: wait for room instead of sleeping, for example by having the t
 All three services implement the same contract ([gateway/docs/contract.md](gateway/docs/contract.md), assembled from `PROMPT.md`), so the gateway can treat them as interchangeable. Summarised as one request:
 
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}, "sequence": {"mirrorActors": false, "actorMargin": 30, "boxMargin": 4, "messageMargin": 22, "noteMargin": 6, "diagramMarginY": 4}}}%%
 sequenceDiagram
     autonumber
     participant C as Client
@@ -271,7 +326,6 @@ sequenceDiagram
 Errors before streaming begins are RFC 9457 `problem+json` responses. After the `200`, the status can't change, so any failure truncates the archive and closes the connection (section 6.2):
 
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}}}%%
 stateDiagram-v2
     [*] --> Admission
     Admission --> Rejected: shutting down, overloaded, bad content type
@@ -301,7 +355,6 @@ Everything public goes through the gateway ([api-gateway/gateway](gateway/README
 
 ### API request
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}, "sequence": {"mirrorActors": false, "actorMargin": 30, "boxMargin": 4, "messageMargin": 22, "noteMargin": 6, "diagramMarginY": 4}}}%%
 sequenceDiagram
     autonumber
     participant C as Client
@@ -328,7 +381,6 @@ sequenceDiagram
 
 ### Browser zip (a job)
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}, "sequence": {"mirrorActors": false, "actorMargin": 30, "boxMargin": 4, "messageMargin": 22, "noteMargin": 6, "diagramMarginY": 4}}}%%
 sequenceDiagram
     autonumber
     participant B as Browser (signed in)
@@ -350,7 +402,6 @@ sequenceDiagram
 
 ### Signing in
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}, "sequence": {"mirrorActors": false, "actorMargin": 30, "boxMargin": 4, "messageMargin": 22, "noteMargin": 6, "diagramMarginY": 4}}}%%
 sequenceDiagram
     participant B as Browser
     participant G as Gateway
@@ -370,7 +421,7 @@ sequenceDiagram
 Accounts are created only at `/account/join`, with a one-time invite code from an admin; no email is ever sent.
 
 ## Claude generation
-**How deeply I reviewed each service.** I went through claude's code properly, file by file; the notes below are from that read. For grok and dsh I skimmed the code and relied on the shared contract tests, smoke tests, `make perf` and targeted reads where something looked off (that is how grok's 100 ms sleep and dsh's false `zipfile` claim turned up). The exception is deployment: the Dockerfiles, CI workflows, deploy workflows and Terraform of all three I reviewed in full, since they run in my AWS account with my credentials.
+**How deeply I reviewed each service.** I went through claude's code in depth; the notes below are from that read. For grok and DSH I skimmed the code and relied on the shared contract tests, smoke tests, `make perf` and targeted reads where something looked off (that is how grok's 100 ms sleep and DSH's false `zipfile` claim turned up). The exception is deployment: the Dockerfiles, CI workflows, deploy workflows and Terraform of all three I reviewed in full, since they run in my AWS account with my credentials.
 
 * final structure good, submodules, sensible separation
 * `v1/zip.py` makes sense. `zip_router` written as an app factory pattern.
@@ -383,6 +434,12 @@ Accounts are created only at `/account/join`, with a one-time invite code from a
   * `OutputBuffer` is what it says on the tin, stores chunks of incoming stream while it compresses and sends them back to the client 
 
 Repository: [zip-agents/claude-code](https://github.com/zip-agents/claude-code). Test coverage: **97%** (unit and integration suites together).
+
+### Tests
+121 tests, in two suites. I didn't ask for integration tests; **claude wrote that suite on its own** (`471900c` "Add integration tests against a real server process"). The one test I asked for later was an explicit end-to-end check that compression is fully streamed (`038b4c5`).
+
+* **Unit tests** (`tests/unit/`, mirroring the package: `api/`, `archive/`, `server/`) are clean and I like them. They are small, one behaviour per test, named after the rule they check (`test_streaming_starts_at_first_file_part`, `test_every_entry_reserves_64_bit_sizes`, `test_skipped_parts_do_not_count_towards_max_files`). Because `ArchiveProcessor` does no I/O, most of them drive it directly with bytes, and the contract example is parametrised over chunk sizes of 1, 7 and 4096 bytes and the whole body at once, so multipart boundaries split anywhere are covered. A small shared helper (`tests/multipart_builder.py`) builds request bodies, so tests read as the parts they send.
+* **Integration tests** (`tests/integration/`) start the real server in a subprocess and test what unit tests can't: half- and full-duplex clients, archive bytes arriving before the upload finishes, idle timeouts and stalled clients, mid-stream aborts truncating the archive, client disconnects releasing resources, the concurrency limit, health staying responsive under heavy compression, graceful shutdown, memory staying bounded and nothing written to disk during a large upload, and every archive checked with `zipfile`, `unzip -t` and `7z t`. Every server's stdout is checked to be JSON lines when the test ends.
 
 ### Structure
 ```text
@@ -410,7 +467,6 @@ zip_service/
 ### Request lifecycle
 How claude implements the [contract's lifecycle](#the-contract), from the request reaching the service:
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}, "sequence": {"mirrorActors": false, "actorMargin": 30, "boxMargin": 4, "messageMargin": 22, "noteMargin": 6, "diagramMarginY": 4}}}%%
 sequenceDiagram
     autonumber
     participant C as Client (via the gateway)
@@ -443,7 +499,6 @@ The three are asyncio tasks on the event loop, not threads; only `feed()` (parsi
 
 ### Zipping method
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
 flowchart LR
     R["receive() chunk<br/>(any size, any boundary)"] --> T["asyncio.to_thread<br/>ArchiveProcessor.feed()"]
     subgraph Worker thread
@@ -462,14 +517,12 @@ flowchart LR
 
 The archive that comes out:
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
 flowchart LR
     A["Local header 1<br/>(Zip64, sizes unknown)"] --> B["data 1<br/>(deflated)"] --> D["data descriptor 1<br/>(CRC, sizes)"] --> E["... entry N ..."] --> CD["central directory"] --> EOCD["end records"]
 ```
 
 ### CI and deployment
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
 flowchart LR
     subgraph CI["CI (every push and pull request)"]
         L["lint + mypy"]
@@ -516,7 +569,6 @@ zip_service/
 
 ### Request lifecycle
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}, "sequence": {"mirrorActors": false, "actorMargin": 30, "boxMargin": 4, "messageMargin": 22, "noteMargin": 6, "diagramMarginY": 4}}}%%
 sequenceDiagram
     autonumber
     participant C as Client
@@ -551,7 +603,6 @@ sequenceDiagram
 
 ### Zipping method
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
 flowchart LR
     R["receive()"] --> MP["AsyncMultipart<br/>(own parser, pull-based,<br/>on the event loop)"]
     MP -->|"Part.iter_chunks()"| EQ["_enqueue()<br/>try_put, else sleep 0.1 s"]
@@ -571,7 +622,6 @@ On an abort, `StreamingZip.abandon()` switches the forwarder to discard and then
 
 The throughput cap:
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}, "sequence": {"mirrorActors": false, "actorMargin": 30, "boxMargin": 4, "messageMargin": 22, "noteMargin": 6, "diagramMarginY": 4}}}%%
 sequenceDiagram
     participant L as event loop
     participant Q as queue (4 slots, 64 KiB each)
@@ -587,7 +637,6 @@ sequenceDiagram
 
 ### CI and deployment
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
 flowchart LR
     subgraph CI["CI (every push and pull request)"]
         C["make check in the dev image:<br/>lint, format, mypy, both suites,<br/>coverage incl. the server process,<br/>warnings for uncovered new lines"]
@@ -620,7 +669,7 @@ Getting the model running at all was by far the biggest time sink of the project
 <p align="center">
   <img src="images/build_it_myself.jpg" alt="Meme: &quot;Faster LLM just dropped, but the optimizations haven't been implemented yet. Better do it myself.&quot;" width="320">
 </p>
-* I also rebuilt my agent sandbox along the way: dsh runs in a full VM (QEMU/KVM) instead of podman, so it can run containers itself rather than me copying commands and results back and forth.
+* I also rebuilt my agent sandbox along the way: DSH runs in a full VM (QEMU/KVM) instead of podman, so it can run containers itself rather than me copying commands and results back and forth.
 
 Once it ran, the performance was beautiful: about **125 tokens/s** in practice (benchmarks around 190), five to six times Qwen 3.8, on hardware under my desk, with no usage limits and nothing leaving the machine. From the commit of `PLAN.md` to the final README took about **an hour and a half** (18:23 to 19:58), the same as claude and grok. Worth it for the experience, but a local model is not a quick option to set up: budget for the infrastructure, not just the model.
 
@@ -647,7 +696,6 @@ Also `journal/` (one file per plan step), and `docs/README.md` and `docs/AGENTS.
 
 ### Request lifecycle
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}, "sequence": {"mirrorActors": false, "actorMargin": 30, "boxMargin": 4, "messageMargin": 22, "noteMargin": 6, "diagramMarginY": 4}}}%%
 sequenceDiagram
     autonumber
     participant C as Client
@@ -684,7 +732,6 @@ sequenceDiagram
 
 ### Zipping method (pull-driven)
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
 flowchart LR
     R["receive()"] --> FD["feeder task<br/>(full: sleep 5 ms)"]
     FD --> Q["queue.Queue<br/>maxsize 2"]
@@ -703,7 +750,6 @@ flowchart LR
 
 ### CI and deployment
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
 flowchart LR
     subgraph CI["CI (every push and pull request)"]
         C["locked install, requirements check,<br/>lint, mypy, unit tests"]
@@ -716,12 +762,11 @@ flowchart LR
     PR["PR touching deploy/"] --> PL["terraform plan<br/>(read-only role)"]
 ```
 
-The CI was dsh's own originally; I reworked it by hand (setup-uv, locked installs, the requirements check, the static job, coverage). Image: single stage on a digest-pinned `python:3.12-slim`, installed from an exported `requirements-docker.txt`, non-root user `zipsvc`, plain `uvicorn` as the command. Same Fargate Spot sizing.
+The CI was DSH's own originally; I reworked it by hand (setup-uv, locked installs, the requirements check, the static job, coverage). Image: single stage on a digest-pinned `python:3.12-slim`, installed from an exported `requirements-docker.txt`, non-root user `zipsvc`, plain `uvicorn` as the command. Same Fargate Spot sizing.
 
 ## Side by side
 Where the work runs, which explains most of the differences, including the speed results:
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
 flowchart TB
     subgraph CL["claude: event loop + to_thread per chunk"]
         direction LR
@@ -751,7 +796,6 @@ flowchart TB
 Each service repository deploys only itself, onto a shared platform defined in this repository. The services' deploy workflows are the same template; what differs between them is CI and the image (see each section above).
 
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
 flowchart TB
     U["Browser / API client"] -->|HTTPS| R53["Route 53<br/>zip-agents.com"]
     R53 --> ALB["ALB<br/>ACM cert, HTTP to HTTPS"]
@@ -769,7 +813,6 @@ flowchart TB
 ```
 
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
 flowchart LR
     subgraph Each service repo
         PR["pull request"] --> CI["CI"]
@@ -784,3 +827,9 @@ flowchart LR
     end
     DEP & GAPPLY -->|"GitHub OIDC token<br/>(no stored keys)"| STS["AWS STS<br/>role per repo, least privilege"]
 ```
+
+## With more time
+* **A custom reasoning harness, then DSH again.** I'm currently writing my own harness, [xgenadam/multistep_reasoning](https://github.com/xgenadam/multistep_reasoning). It breaks a complex task down into sub-tasks and runs them in parallel, with more to come. Once it's done, I'd like to implement its methods as a custom reasoning harness for DSH and run DSH through this exercise again.
+* **Rerun the other agents the same way.** I'd redo claude and grok with the plan-and-journal process I used for DSH, so the three are compared on the same process, and rerun DSH on the Flash Next optimisations from my runner work.
+* **A more polished front end.** The portal is good enough for a PoC or MVP, but I'd add proper styling and improve the navigation.
+* **Audit grok's and DSH's code properly.** I reviewed claude's code in depth, but only skimmed grok's and DSH's (apart from their deployment). The two biggest problems I know of, grok's throughput cap and DSH's false `zipfile` claim, both turned up from targeted reads, so a full audit would likely find more.
