@@ -60,11 +60,16 @@ terraform -chdir=terraform/prod apply
 The gateway's secret holds the operator keys (`name:key`, comma-separated) and the session
 secret. The gateway won't start until it has a value. First time, with the smoke key:
 
+Each line stands alone, so a terminal that wraps a pasted line can't split a command
+(a split inside `$( … )` silently stores the wrong value). Check the lengths before
+storing: 54 and 64 here.
+
 ```bash
 SMOKE_KEY=$(openssl rand -hex 24); echo "smoke key: $SMOKE_KEY"
-aws secretsmanager put-secret-value --secret-id zip-platform/prod/gateway \
-  --secret-string "$(jq -cn --arg k "smoke:$SMOKE_KEY" --arg s "$(openssl rand -hex 32)" \
-    '{GATEWAY_API_KEYS: $k, GATEWAY_SESSION_SECRET: $s}')"
+F='{GATEWAY_API_KEYS: $k, GATEWAY_SESSION_SECRET: $s}'
+SECRET=$(jq -cn --arg k "smoke:$SMOKE_KEY" --arg s "$(openssl rand -hex 32)" "$F")
+echo "$SECRET" | jq 'map_values(length)'
+aws secretsmanager put-secret-value --secret-id zip-platform/prod/gateway --secret-string "$SECRET"
 ```
 
 Put the smoke key in each repository's `SMOKE_API_KEY` secret. To add one more key later,
@@ -72,10 +77,11 @@ leaving the others and every session alone:
 
 ```bash
 NAME=alice; KEY=$(openssl rand -hex 24); echo "$NAME key: $KEY"
-CURRENT=$(aws secretsmanager get-secret-value --secret-id zip-platform/prod/gateway \
-  --query SecretString --output text)
-aws secretsmanager put-secret-value --secret-id zip-platform/prod/gateway \
-  --secret-string "$(jq -c --arg k "$NAME:$KEY" '.GATEWAY_API_KEYS += "," + $k' <<<"$CURRENT")"
+ID=zip-platform/prod/gateway
+CURRENT=$(aws secretsmanager get-secret-value --secret-id $ID --query SecretString --output text)
+SECRET=$(jq -c --arg k "$NAME:$KEY" '.GATEWAY_API_KEYS += "," + $k' <<<"$CURRENT")
+echo "$SECRET" | jq 'map_values(length)'
+aws secretsmanager put-secret-value --secret-id $ID --secret-string "$SECRET"
 aws ecs update-service --cluster zip-platform-prod --service gateway --force-new-deployment
 ```
 
