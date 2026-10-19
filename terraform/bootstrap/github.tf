@@ -189,10 +189,15 @@ data "aws_iam_policy_document" "service_deploy" {
     actions = [
       "ecs:CreateService", "ecs:UpdateService", "ecs:DeleteService", "ecs:DescribeServices",
       "ecs:TagResource", "ecs:UntagResource", "ecs:ListTagsForResource",
+      # wait_for_steady_state: the AWS provider follows the rollout through these
+      "ecs:ListServiceDeployments", "ecs:DescribeServiceDeployments",
+      "ecs:DescribeServiceRevisions",
     ]
     resources = [
       "arn:aws:ecs:${var.region}:${local.account_id}:service/${local.cluster_name}/${each.key}",
       "arn:aws:ecs:${var.region}:${local.account_id}:task-definition/${local.cluster_name}-${each.key}:*",
+      "arn:aws:ecs:${var.region}:${local.account_id}:service-deployment/${local.cluster_name}/${each.key}/*",
+      "arn:aws:ecs:${var.region}:${local.account_id}:service-revision/${local.cluster_name}/${each.key}/*",
     ]
   }
   statement {
