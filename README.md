@@ -10,6 +10,16 @@ Broadly it is to do the following:
 * containerise the service via Docker
 * create a CI/CD pipeline, GitHub actions is recommended but it is left up to me to decide what and how.
 
+## Repositories
+All in the [zip-agents](https://github.com/zip-agents) GitHub organisation, live at https://zip-agents.com.
+
+| Repository | What it is |
+|---|---|
+| [api-gateway](https://github.com/zip-agents/api-gateway) | this repo: the gateway, the shared AWS platform (Terraform), local compose stack, smoke and performance tests |
+| [claude-code](https://github.com/zip-agents/claude-code) | the zip service written by Claude Code (Opus 5.5) |
+| [grok-build](https://github.com/zip-agents/grok-build) | the zip service written by Grok Build (4.7) |
+| [dsh-qwen-flash-next](https://github.com/zip-agents/dsh-qwen-flash-next) | the zip service written by dsh with Qwen 3.8 Flash Next, running locally |
+
 ## My initial approach
 First thing was to research how FastAPI handles file uploads and the fine details of zipping files.
 
@@ -167,7 +177,610 @@ Claude finished planning first, then grok, then much later dsh (expected as loca
 all tried to make it dual use as a cli tool, my stupid fault. this resulted in initial flat directory structure which was less readable and poorly organised
 all tried rolling their own zip functionality. The prompt should have explained why we wanted 64 bit, not for the sake of it but for files greater than 4 GiB.
 
+<p align="center">
+  <img src="images/im_an_idiot.jpg" alt="Meme: &quot;That feeling you get when you realise you are the idiot.&quot;" width="320">
+</p>
 
-## Post generation writeup
+
+## What I had to correct, and changing the process for dsh
+
+### The same two corrections, in all three
+Every agent needed the same two pushbacks, dsh included, even though it had a written plan:
+
+1. **Structure.** All three started flat: modules side by side at the top level, and packaged as a CLI tool as well as an API. I had to tell each of them to restructure into submodules by responsibility (API, archive, server or pipeline). Visible in the histories: claude's `2c5068e` "Restructure as an API: main.py entrypoint, packages by responsibility" and grok's `5c4146d` "Lay the API out as a service instead of an installable package". Even after being told, grok kept CLI leftovers (`__main__.py`).
+2. **Rolling their own zip stack.** All three set out to write their own ZIP writer instead of using a library. claude (`02b57c1` "Add streaming Zip64 writer", then `890b6df` "Replace the custom Zip64 writer with stdlib zipfile") and grok (`6099862`, then `9729a01` "... write archives with zipfile") moved to the standard library's `zipfile` once told. dsh moved to a library, but **the wrong one**: it chose `zipstream-ng` because "`ZipFile.open(name, "w")` is STORED-only on 3.12". That is false; I checked, and `zipfile` streams DEFLATE to an output that can't seek. The mistake cost an LGPL dependency, and a hack that replaces the library's `time` module with a per-thread proxy just to set the entries' timestamps, which `zipfile` does with one field.
+
+The cause of both is the prompt, not the models. It said "every entry MUST be written with Zip64 extensions" without saying why (files over 4 GiB). Read literally, the standard library doesn't do that: it puts Zip64 in the local header only. So writing their own was a reasonable reading of what I wrote. dsh's prompt even said "you may write it yourself (it isn't large)". The flat CLI layout came from similar ambiguity about what was being built. The lesson: **give the intent behind a requirement, not just the requirement.**
+
+### dsh: a plan first, then a journal
+For claude and grok I used each tool's plan mode: I reviewed the plan, then they built (both kept a `PLAN.md`). For dsh I changed the process to give the agent more structure: a long-running local model has to stay on track over many hours and pick up again after interruptions. The prompt made the agent:
+
+* **write `PLAN.md` and commit it before any code**: goal and success criteria, environment facts it had verified, the repository layout, library decisions with reasons, the architecture of one request, assumptions where the contract is silent, the order of work with the riskiest parts first, and the verification commands
+* **keep a journal as it goes**, not at the end: `journal/INDEX.md` with one row per task and its status, and one file per task (`journal/01-project-skeleton.md` ... `13-documentation-conformance.md`) with what it did, the decisions and why, and the checks it ran with their results
+* **update the plan when it changes**, and say why in the journal
+
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
+flowchart LR
+    P["PROMPT.md<br/>(contract + process)"] --> PL["PLAN.md<br/>committed before any code"]
+    PL --> T["next task"]
+    T --> J["journal entry:<br/>goal, what I did,<br/>decisions, checks"]
+    J --> C["code + tests"] --> V["verify"] --> CM["commit<br/>(one per task)"]
+    CM --> IX["INDEX.md status"] --> T
+    V -. "plan changed" .-> PL
+```
+
+**What worked**
+* The history reads like the plan: 13 tasks, one commit each, in order (`b85df5f` "add PLAN.md and journal skeleton before any code", then the skeleton, config, ...).
+* Risks first: task 3 was a spike proving full-duplex streaming on real uvicorn before anything was built on it.
+* Assumptions written down where the contract is silent, so they can be reviewed rather than discovered.
+* I could review it one task at a time, and when I found something odd, the journal told me *why* it had been done. That is how I found the false `zipfile` claim: it was written in the plan and in `journal/04-zip-adapter.md` as a verified fact.
+
+**What it didn't fix**
+* A plan doesn't make a claim true. The `zipfile` claim was stated confidently in the plan, then built on for the rest of the project. The journal made the mistake easy to find, not less likely.
+* Drift: the plan's layout lists modules that were never written (`lifecycle.py`, `problems.py`, `pipeline/state.py`, ...), the logic went elsewhere, and neither the plan nor the journal says so. Docstrings still refer to `pipeline/state.py`.
+* It still started flat and still tried to roll its own zip writer (above). The structure has to be in the prompt; the process alone doesn't supply it.
+
+Overall dsh had the most disciplined process and the most reviewable output of the three, and its speed ended up close to claude's. I'd use the plan-and-journal approach again for any long-running or local agent, and I'd add one thing: a step that checks each "verified" claim in the plan, by a test or by me.
+
+### grok is slower, and only manual testing caught it
+All three pass the same contract tests and smoke tests. grok is still about **12× slower** than claude on a large file, and takes **38 s for 500 small files** where claude takes 0.1 s. I only noticed when I used the portal in a browser and grok's zips were obviously slower. I then wrote `make perf` (`perf/bench.py`) to measure it:
+
+| | claude | grok | dsh |
+|---|---|---|---|
+| 1 × 100 MiB random | 36.8 MiB/s | 3.0 MiB/s | about 37 MiB/s |
+| 1 × 100 MiB zeros | 186 MiB/s | 3.3 MiB/s | 84 MiB/s |
+| 500 × 4 KiB files | 0.10 s | 37.7 s | 0.14 s |
+| time to first byte | 10–30 ms | 10 ms | under 10 ms |
+
+**Why.** grok parses on the event loop and compresses on a separate thread, connected by a queue of only four 64 KiB chunks. When the queue is full, the event loop doesn't wait for room: it sleeps a fixed 100 ms and tries again (`_enqueue` in `api/endpoint.py`). The thread compresses the 256 KiB in a few milliseconds and then sits idle for the rest of the 100 ms. So throughput is capped at about 256 KiB per 100 ms, roughly 2.5 MiB/s, whatever the CPU or network (see the diagram in the Grok section). Zeros are no faster than random data, which shows the cap is the queue, not the compression. Each file is three queue items (start, data, end), so small files hit the same sleep: about 75 ms per file, against 75.5 ms measured. Four parallel uploads get 4 × 3 MiB/s, so the cap is per request, not CPU.
+
+The fix is small: wait for room instead of sleeping, for example by having the thread set an asyncio event (`call_soon_threadsafe`) when it takes an item, or by awaiting `asyncio.to_thread(queue.put, item)`. A bigger queue would only raise the cap. I kept it as a documented result rather than fixing it, since the point is to compare the agents.
+
+**Why the tests missed it.** Nothing in the contract or the tests mentions throughput. The tests check that archives are correct and that streaming starts early (time to first byte), and grok passes both. A 10–30× difference was invisible until a person used it. Performance needs its own check: with more time I would add a throughput floor to the smoke tests (for example, 200 MiB within a set time), so a regression like this fails CI.
+
+## The contract
+All three services implement the same contract ([gateway/docs/contract.md](gateway/docs/contract.md), assembled from `PROMPT.md`), so the gateway can treat them as interchangeable. Summarised as one request:
+
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "sequence": {"mirrorActors": false, "actorMargin": 30, "boxMargin": 4, "messageMargin": 22, "noteMargin": 6, "diagramMarginY": 4}}}%%
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as Zip service
+
+    C->>S: POST /api/v1/zip (multipart/form-data)
+    S->>S: admission: shutting down? (503) over MAX_CONCURRENT_REQUESTS? (503 + Retry-After)
+    S->>S: Content-Type: multipart? (415) boundary? (400)
+    loop parts before the first file
+        C->>S: field part, e.g. filename
+        S->>S: validate the archive name (422)
+    end
+    C->>S: first file part (field "files")
+    S-->>C: 200, Content-Disposition, no Content-Length (streaming begins, section 5)
+    loop each file part, as bytes arrive
+        C->>S: file bytes
+        S-->>C: compressed zip bytes
+        Note over C,S: output buffered up to OUTPUT_BUFFER_MAX_BYTES, then the service stops reading (section 4.1)
+    end
+    C->>S: closing boundary
+    S-->>C: central directory, end records, end of body
+    S->>S: one completion log line with the request ID
+```
+
+Errors before streaming begins are RFC 9457 `problem+json` responses. After the `200`, the status can't change, so any failure truncates the archive and closes the connection (section 6.2):
+
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}}}%%
+stateDiagram-v2
+    [*] --> Admission
+    Admission --> Rejected: shutting down, overloaded, bad content type
+    Admission --> Parsing
+    Parsing --> Rejected: bad filename, wrong field, malformed, timeout
+    Parsing --> Streaming: first file part (200 sent)
+    Streaming --> Streaming: more parts
+    Streaming --> Completed: closing boundary, end records sent
+    Streaming --> Aborted: any error (connection closed, zip truncated)
+    Streaming --> Disconnected: client went away
+    Rejected --> [*]: 4xx / 503 problem+json
+    Completed --> [*]
+    Aborted --> [*]
+    Disconnected --> [*]
+```
+
+Plus health endpoints (`/health/live`, `/health/ready`), graceful shutdown on SIGTERM within `SHUTDOWN_GRACE_SECONDS`, JSON logs, request IDs, and the documentation endpoints the gateway uses to show each service's docs.
+
+## The API gateway
+Everything public goes through the gateway ([api-gateway/gateway](gateway/README.md)), written with Claude Code. The services only ever see requests the gateway has already authenticated; they are not reachable from the internet.
+
+* routes `/<service>/...` to that service over Cloud Map (`claude.zip.internal`), streaming both ways without buffering
+* authenticates API calls: operator keys (Secrets Manager) or users' own keys (stored hashed in Aurora)
+* per-user quotas on the API, rate limits on the portal's sign-in and invite forms, request IDs, one access log line per request
+* the portal: Cognito sign-in, invite codes, API keys, an admin area, the services' docs and OpenAPI under one site
+* browser zipping: browsers send the whole upload before reading the response, which the contract's output buffer limits, so the gateway splits a browser zip into an upload and a download request and joins them into one full-duplex exchange with the service
+
+### API request
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "sequence": {"mirrorActors": false, "actorMargin": 30, "boxMargin": 4, "messageMargin": 22, "noteMargin": 6, "diagramMarginY": 4}}}%%
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant ALB as ALB (TLS)
+    participant G as Gateway
+    participant S as Service
+
+    C->>ALB: POST /claude/api/v1/zip (Bearer key)
+    ALB->>G: HTTP
+    G->>G: X-Request-ID, route by the first path segment
+    G->>G: Authenticator: operator key or user key
+    alt no or bad key
+        G-->>C: 401 problem+json
+    end
+    G->>G: quota for the key's owner
+    alt over quota
+        G-->>C: 429 + Retry-After
+    end
+    G->>S: forward to claude.zip.internal, path /api/v1/zip
+    S-->>G: response streamed as produced
+    G-->>C: passed straight through
+    G->>G: record bytes against the quota, log the request
+```
+
+### Browser zip (a job)
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "sequence": {"mirrorActors": false, "actorMargin": 30, "boxMargin": 4, "messageMargin": 22, "noteMargin": 6, "diagramMarginY": 4}}}%%
+sequenceDiagram
+    autonumber
+    participant B as Browser (signed in)
+    participant G as Gateway
+    participant S as Service
+
+    B->>G: POST /zip/jobs (service: claude)
+    G-->>B: job id, upload and download URLs
+    par download
+        B->>G: GET /zip/jobs/id/archive
+    and upload
+        B->>G: POST /zip/jobs/id/files (multipart)
+    end
+    G->>S: the upload body, as an API request
+    S-->>G: zip bytes
+    G-->>B: zip bytes to the download, saved to disk
+    G-->>B: upload answered with a small JSON outcome
+```
+
+### Signing in
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "sequence": {"mirrorActors": false, "actorMargin": 30, "boxMargin": 4, "messageMargin": 22, "noteMargin": 6, "diagramMarginY": 4}}}%%
+sequenceDiagram
+    participant B as Browser
+    participant G as Gateway
+    participant CG as Cognito (hosted UI)
+    participant DB as Aurora
+
+    B->>G: GET /account/auth/start
+    G-->>B: redirect to Cognito (OIDC, code + PKCE)
+    B->>CG: email, password
+    CG-->>B: redirect back with a code
+    B->>G: callback with the code
+    G->>CG: exchange code for tokens
+    G->>DB: record the sign-in, check the user isn't disabled
+    G-->>B: signed session cookie
+```
+
+Accounts are created only at `/account/join`, with a one-time invite code from an admin; no email is ever sent.
+
+## Claude generation
+**How deeply I reviewed each service.** I went through claude's code properly, file by file; the notes below are from that read. For grok and dsh I skimmed the code and relied on the shared contract tests, smoke tests, `make perf` and targeted reads where something looked off (that is how grok's 100 ms sleep and dsh's false `zipfile` claim turned up). The exception is deployment: the Dockerfiles, CI workflows, deploy workflows and Terraform of all three I reviewed in full, since they run in my AWS account with my credentials.
+
+* final structure good, submodules, sensible separation
+* `v1/zip.py` makes sense. `zip_router` written as an app factory pattern.
+  * takes raw file, no spooling to disk
+  * sensible sanitisation of file names
+* `streaming.py` 
+  * `ZipPipeline`, heart of the api
+    * appropriately uses threading to read, write and watch (enforcing idle duration and limits) the stream
+      * threading used because 
+  * `OutputBuffer` is what it says on the tin, stores chunks of incoming stream while it compresses and sends them back to the client 
+
+Repository: [zip-agents/claude-code](https://github.com/zip-agents/claude-code). Test coverage: **97%** (unit and integration suites together).
+
+### Structure
+```text
+zip_service/
+├── app.py                 create_app(): routers, error handlers, middleware
+├── config.py              Settings (limits, from the environment)
+├── api/
+│   ├── v1/zip.py          POST /api/v1/zip: admission, then ZipPipeline
+│   ├── streaming.py       ZipPipeline: read / write / watchdog tasks, OutputBuffer
+│   ├── middleware.py      request IDs, access log (plain ASGI, doesn't buffer)
+│   ├── problems.py        RFC 9457 error responses
+│   ├── openapi.py docs.py hand-written schema, served docs
+│   └── health.py
+├── archive/
+│   ├── processor.py       ArchiveProcessor: multipart in, zip out (stdlib zipfile)
+│   ├── multipart.py       Content-Type / Content-Disposition parsing
+│   └── naming.py          255-byte rules, sanitising, de-duplication
+└── server/
+    ├── server.py          uvicorn subclass: graceful SIGTERM drain
+    ├── lifecycle.py       InflightTracker: concurrency cap, shutdown
+    ├── context.py         per-request stats (contextvars)
+    └── logging.py         JSON logs
+```
+
+### Request lifecycle
+How claude implements the [contract's lifecycle](#the-contract), from the request reaching the service:
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "sequence": {"mirrorActors": false, "actorMargin": 30, "boxMargin": 4, "messageMargin": 22, "noteMargin": 6, "diagramMarginY": 4}}}%%
+sequenceDiagram
+    autonumber
+    participant C as Client (via the gateway)
+    participant M as RequestContextMiddleware
+    participant Z as create_zip
+    participant P as ZipPipeline
+
+    C->>M: POST /api/v1/zip
+    M->>M: request ID, start the access log line
+    M->>Z: route
+    Z->>Z: InflightTracker: shutting down? at capacity?
+    Z->>Z: multipart boundary from Content-Type
+    alt rejected
+        Z-->>C: 503 / 415 / 400 problem+json
+    end
+    Z->>P: ZipPipeline owns the slot from here
+    par read task
+        P->>P: receive() chunk, then feed() in a worker thread
+    and write task
+        P-->>C: 200 headers at the first file part, then zip chunks
+    and watchdog task
+        P->>P: idle timeout and max duration
+    end
+    P-->>C: central directory, end records, end of body
+    P->>Z: release the slot
+    M->>M: one completion log line
+```
+
+The three are asyncio tasks on the event loop, not threads; only `feed()` (parsing and compression) runs in a worker thread, through `asyncio.to_thread`. `_guard` turns whichever task fails first into the request's single outcome.
+
+### Zipping method
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
+flowchart LR
+    R["receive() chunk<br/>(any size, any boundary)"] --> T["asyncio.to_thread<br/>ArchiveProcessor.feed()"]
+    subgraph Worker thread
+        T --> MP["MultipartParser<br/>(push parser, callbacks)"]
+        MP -->|"filename field"| N["validate archive name"]
+        MP -->|"file part begins"| SE["start_entry()<br/>local header, Zip64"]
+        MP -->|"part data"| W["write()<br/>DEFLATE + CRC-32"]
+        MP -->|"part ends"| EE["end_entry()<br/>data descriptor"]
+        SE & W & EE --> ZF["stdlib zipfile"]
+        ZF --> SK["_Sink<br/>(cannot seek)"]
+    end
+    SK -->|"take() bytes"| OB["OutputBuffer<br/>(bounded, 16 MiB)"]
+    OB --> SND["send() to client"]
+    OB -. "full: pause reading<br/>(backpressure)" .-> R
+```
+
+The archive that comes out:
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
+flowchart LR
+    A["Local header 1<br/>(Zip64, sizes unknown)"] --> B["data 1<br/>(deflated)"] --> D["data descriptor 1<br/>(CRC, sizes)"] --> E["... entry N ..."] --> CD["central directory"] --> EOCD["end records"]
+```
+
+### CI and deployment
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
+flowchart LR
+    subgraph CI["CI (every push and pull request)"]
+        L["lint + mypy"]
+        F["unit tests"]
+        S["all tests under coverage<br/>(unzip and 7z validate archives),<br/>diff coverage on PRs"]
+        I["build image, smoke-test it,<br/>publish to GHCR on push"]
+    end
+    CI -->|"success on main"| D["deploy (prod environment)"]
+    D --> E["build, push to ECR<br/>(immutable tag = commit)"] --> A["terraform apply<br/>shared ecs-service module"] --> K["check through the gateway"]
+    PR["PR touching deploy/"] --> PL["terraform plan<br/>(read-only role)"]
+```
+
+Image: multi-stage on a pinned Python base with uv, runs as UID 10001, `python main.py` (a uvicorn subclass that drains on SIGTERM). Runs on Fargate Spot, 0.25 vCPU and 1 GiB; the memory budget is `MAX_CONCURRENT_REQUESTS` × `OUTPUT_BUFFER_MAX_BYTES` plus headroom.
+
+## Grok generation
+Repository: [zip-agents/grok-build](https://github.com/zip-agents/grok-build). Test coverage: **89%**.
+
+* the same contract and tests pass, but it is about 12× slower than claude on large files and takes 38 s for 500 small files. The cause is one line: when its 4-slot queue to the zip thread is full, the event loop sleeps 100 ms instead of waiting for room.
+* wrote its own multipart parser (`api/multipart.py`, 535 lines) even though `python-multipart` comes with FastAPI. The same habit as the zip library, but this time I didn't redirect it.
+* parsing runs on the event loop; one zip thread per request does the compression.
+
+### Structure
+```text
+zip_service/
+├── __main__.py        entrypoint (leftover of the CLI phase)
+├── app.py             create_app(): health, docs, error handlers, request IDs
+├── config.py          Settings
+├── documents.py       docs catalogue
+├── api/
+│   ├── endpoint.py    ZipEndpoint: admission, parse loop, _enqueue, writer task
+│   ├── multipart.py   hand-written multipart decoder (sync core + async wrapper)
+│   ├── gate.py        in-flight counter, graceful shutdown
+│   ├── openapi.py
+│   └── problems.py    RFC 9457 errors
+├── archive/
+│   ├── zipstream.py   StreamingZip + ZipWorker thread
+│   ├── names.py       archive and entry name rules
+│   └── disposition.py Content-Disposition header
+└── runtime/
+    ├── buffer.py      thread-safe bounded OutputBuffer
+    ├── constants.py   queue size, chunk size, limits
+    └── jsonlog.py
+```
+
+### Request lifecycle
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "sequence": {"mirrorActors": false, "actorMargin": 30, "boxMargin": 4, "messageMargin": 22, "noteMargin": 6, "diagramMarginY": 4}}}%%
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant E as ZipEndpoint (event loop)
+    participant W as ZipWorker thread
+    participant B as OutputBuffer
+    participant T as writer task
+
+    C->>E: POST /api/v1/zip (multipart)
+    E->>E: shutting down? content type? Gate.try_acquire()
+    alt rejected
+        E-->>C: 4xx / 503 problem+json
+    end
+    loop AsyncMultipart.next_part()
+        E->>E: filename field: read_limited, validate
+    end
+    Note over E: first file part
+    E->>W: start thread
+    E-->>C: 200 headers
+    E->>T: create writer task
+    loop each file part
+        E->>W: _enqueue start, data..., end
+        Note over E,W: queue full: sleep 100 ms and retry (the throughput cap)
+        W->>B: zipfile writes (blocks while full)
+        T->>B: read()
+        T-->>C: zip chunks
+    end
+    E->>W: _enqueue FINISH
+    W->>B: central directory, end records
+    T-->>C: last chunks, end of body
+```
+
+### Zipping method
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
+flowchart LR
+    R["receive()"] --> MP["AsyncMultipart<br/>(own parser, pull-based,<br/>on the event loop)"]
+    MP -->|"Part.iter_chunks()"| EQ["_enqueue()<br/>try_put, else sleep 0.1 s"]
+    EQ --> Q["queue.Queue<br/>maxsize 4"]
+    subgraph Zip thread
+        Q --> RUN["ZipWorker._run<br/>start / data / end / FINISH"]
+        RUN --> SZ["StreamingZip<br/>stdlib zipfile, force_zip64"]
+        SZ --> FW["_Forwarder<br/>(discard() on abort)"]
+        FW --> SK["_Sink"]
+    end
+    SK --> OB["OutputBuffer<br/>Condition, wakes loop via<br/>call_soon_threadsafe"]
+    OB --> WT["writer task: send()"]
+    OB -. "full: zip thread blocks,<br/>queue fills, loop stops reading" .-> Q
+```
+
+On an abort, `StreamingZip.abandon()` switches the forwarder to discard and then closes the `ZipFile`, so the end records are never sent (claude solves the same problem with a no-op `__del__`).
+
+The throughput cap:
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "sequence": {"mirrorActors": false, "actorMargin": 30, "boxMargin": 4, "messageMargin": 22, "noteMargin": 6, "diagramMarginY": 4}}}%%
+sequenceDiagram
+    participant L as event loop
+    participant Q as queue (4 slots, 64 KiB each)
+    participant W as zip thread
+    L->>Q: put 4 chunks (256 KiB)
+    L->>Q: try_put: full
+    L->>L: sleep 100 ms
+    Q->>W: 4 chunks
+    W->>W: compress in a few ms, then idle
+    Note over L,W: about 256 KiB per 100 ms = about 2.5 MiB/s, whatever the CPU
+    L->>Q: put 4 more chunks
+```
+
+### CI and deployment
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
+flowchart LR
+    subgraph CI["CI (every push and pull request)"]
+        C["make check in the dev image:<br/>lint, format, mypy, both suites,<br/>coverage incl. the server process,<br/>warnings for uncovered new lines"]
+        I["build runtime image, smoke-test it"]
+    end
+    CI -->|"success on main"| D["deploy (prod environment)"]
+    D --> E["build, push to ECR"] --> A["terraform apply<br/>shared ecs-service module"] --> K["check through the gateway"]
+    PR["PR touching deploy/"] --> PL["terraform plan<br/>(read-only role)"]
+```
+
+Everything in CI runs inside its dev image through `make`, so a local run and CI are the same. Image: multi-stage on a digest-pinned `python:3.12-slim-bookworm`, non-root user `zip`, `python -m zip_service`. Same Fargate Spot sizing as claude.
+
+## DSH (Qwen 3.8 Flash Next) generation
+Repository: [zip-agents/dsh-qwen-flash-next](https://github.com/zip-agents/dsh-qwen-flash-next). Test coverage: **93%** (it had no coverage; I added `make coverage` and a CI step afterwards).
+
+* the most disciplined process: `PLAN.md` first, a journal entry per step (`journal/01-13`), assumptions written down, and full streaming proven before building on it.
+* close to claude's speed.
+* used `zipstream-ng` instead of stdlib `zipfile`, for a reason that is false ("`ZipFile.open(name, "w")` is STORED-only on 3.12"). That cost an LGPL dependency and a hack that replaces the library's `time` module with a per-thread proxy just to set entry timestamps.
+* the flow is inverted: the zip library *pulls* entry data, pulling drives the parser, and the parser pulls from the queue. It works, but it is the hardest of the three to follow.
+* a possible freeze: the event loop makes blocking `queue.put()` calls in two places. I couldn't trigger it, but it's more likely at 0.25 vCPU.
+
+### The cost: getting Qwen 3.8 Flash Next running
+Getting the model running at all was by far the biggest time sink of the project: **a day and a half**, against about 90 minutes each for claude and grok to build their whole service.
+
+* Qwen 3.8 itself ran at about 18–23 tokens/s on my machine (4× RTX 3090). Left overnight it finished some steps, but at that rate the service would have taken days.
+* So I switched to Qwen 3.8 Flash Next, served by vLLM with W4A16 weights, using a setup tuned for exactly this hardware: [tonyd2wild/Qwen38-Flash-Next-4x3090](https://github.com/tonyd2wild/Qwen38-Flash-Next-4x3090/tree/main/vllm-w4a16). It didn't start: it pinned a nightly vLLM image that had been deleted from Docker Hub. My fork, [xgenadam/Qwen38-Flash-Next-4x3090](https://github.com/xgenadam/Qwen38-Flash-Next-4x3090), has the work, sent upstream as two pull requests:
+  * [PR #2](https://github.com/tonyd2wild/Qwen38-Flash-Next-4x3090/pull/2), **getting it running**: rebuilds the image from the same vLLM commit's published wheel (checksum-verified, every dependency pinned) so it reproduces the tuned setup exactly; makes the launcher portable (no hard-coded home paths, podman as well as Docker) and verifies at start that its patches are the files actually loaded; and adds a prefix-caching variant.
+  * [PR #3](https://github.com/tonyd2wild/Qwen38-Flash-Next-4x3090/pull/3), **improving it**: performance work on the runner, to cut time to first token and raise tokens/s.
+
+<p align="center">
+  <img src="images/build_it_myself.jpg" alt="Meme: &quot;Faster LLM just dropped, but the optimizations haven't been implemented yet. Better do it myself.&quot;" width="320">
+</p>
+* I also rebuilt my agent sandbox along the way: dsh runs in a full VM (QEMU/KVM) instead of podman, so it can run containers itself rather than me copying commands and results back and forth.
+
+Once it ran, the performance was beautiful: about **125 tokens/s** in practice (benchmarks around 190), five to six times Qwen 3.8, on hardware under my desk, with no usage limits and nothing leaving the machine. From the commit of `PLAN.md` to the final README took about **an hour and a half** (18:23 to 19:58), the same as claude and grok. Worth it for the experience, but a local model is not a quick option to set up: budget for the infrastructure, not just the model.
+
+### Structure
+```text
+src/zip_service/
+├── app.py              app factory, health, shutdown (self-SIGINT, os._exit)
+├── config.py
+├── api/
+│   ├── zip_endpoint.py raw ASGI endpoint: gate, feeder, worker thread, phases
+│   ├── docs.py         docs and OpenAPI
+│   └── problem.py
+├── pipeline/
+│   ├── source.py       feeder (loop) + ASGIByteSource (worker), timeouts
+│   ├── request.py      ZipRequestHandler: multipart callbacks, start/run
+│   ├── multipart.py    Content-Disposition parsing
+│   └── output.py       OutputChannel: bounded deque, drain task
+├── archive/
+│   ├── streaming.py    ArchiveStream over zipstream-ng, time-module pin
+│   └── names.py
+└── observability/      JSON logs, request-ID middleware
+```
+Also `journal/` (one file per plan step), and `docs/README.md` and `docs/AGENTS.md`, kept in `docs/` so the image can serve them.
+
+### Request lifecycle
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "sequence": {"mirrorActors": false, "actorMargin": 30, "boxMargin": 4, "messageMargin": 22, "noteMargin": 6, "diagramMarginY": 4}}}%%
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant E as ZipEndpoint (event loop)
+    participant F as feeder task
+    participant W as worker thread
+    participant O as OutputChannel + drain task
+
+    C->>E: POST /api/v1/zip (multipart)
+    E->>E: ConcurrencyGate, content type, boundary
+    alt rejected
+        E-->>C: 4xx / 503 problem+json
+    end
+    E->>F: start feeder (receive() into queue, max 2)
+    E->>W: start worker thread
+    Note over W: phase 1: handler.start() parses until the first file part
+    alt problem before streaming
+        W-->>E: pre_start_problem
+        E-->>C: 4xx problem+json
+    end
+    W-->>E: first_event (archive name known)
+    E-->>C: 200 headers
+    E->>O: channel.start()
+    Note over W: phase 2: handler.run() pumps the archive
+    loop until footer
+        F->>W: body chunks via queue
+        W->>O: push(zip bytes) (blocks while full)
+        O-->>C: send()
+    end
+    W-->>E: worker_done
+    E->>O: wait_done
+    O-->>C: end of body
+```
+
+### Zipping method (pull-driven)
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
+flowchart LR
+    R["receive()"] --> FD["feeder task<br/>(full: sleep 5 ms)"]
+    FD --> Q["queue.Queue<br/>maxsize 2"]
+    subgraph Worker thread
+        Q --> SRC["ASGIByteSource.read()<br/>idle + total clocks"]
+        PUMP["ArchiveStream.pump()<br/>zipstream-ng generators"] -->|"needs entry bytes"| IT["entry iterable<br/>_entry_next()"]
+        IT -->|"buffer empty: _feed()"| MP["python-multipart<br/>callbacks"]
+        MP --> SRC
+        MP -->|"file part: add_entry()"| PUMP
+        TP["time-module proxy<br/>pins request timestamp"] -.-> PUMP
+    end
+    PUMP -->|"CHUNK"| OC["OutputChannel.push()<br/>deque, Condition"]
+    OC --> DR["drain task: send()"]
+    OC -. "full: worker blocks,<br/>queue fills, feeder stops calling receive()" .-> Q
+```
+
+### CI and deployment
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
+flowchart LR
+    subgraph CI["CI (every push and pull request)"]
+        C["locked install, requirements check,<br/>lint, mypy, unit tests"]
+        S["workflows (actionlint)<br/>and terraform fmt"]
+        T["all tests under coverage<br/>(unzip and 7z)"]
+        I["build image, container smoke"]
+    end
+    CI -->|"success on main"| D["deploy (prod environment)"]
+    D --> E["build, push to ECR"] --> A["terraform apply<br/>shared ecs-service module"] --> K["check through the gateway"]
+    PR["PR touching deploy/"] --> PL["terraform plan<br/>(read-only role)"]
+```
+
+The CI was dsh's own originally; I reworked it by hand (setup-uv, locked installs, the requirements check, the static job, coverage). Image: single stage on a digest-pinned `python:3.12-slim`, installed from an exported `requirements-docker.txt`, non-root user `zipsvc`, plain `uvicorn` as the command. Same Fargate Spot sizing.
+
+## Side by side
+Where the work runs, which explains most of the differences, including the speed results:
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
+flowchart TB
+    subgraph CL["claude: event loop + to_thread per chunk"]
+        direction LR
+        c1["receive()"] --> c2["to_thread(feed)<br/>parse + zip, stdlib zipfile"] --> c3["OutputBuffer<br/>(asyncio, 16 MiB)"] --> c4["send()"]
+    end
+    subgraph GR["grok: parse on loop, one zip thread per request"]
+        direction LR
+        g1["receive()"] --> g2["hand-written<br/>multipart parser (loop)"] --> g3["queue, 4 slots<br/>full: sleep 100 ms"] --> g4["zip thread<br/>stdlib zipfile"] --> g5["OutputBuffer<br/>(thread-safe)"] --> g6["writer task<br/>send()"]
+    end
+    subgraph DS["dsh: feeder on loop, one parse+zip thread per request"]
+        direction LR
+        d1["feeder task<br/>receive()"] --> d2["queue, 2 slots<br/>full: sleep 5 ms"] --> d3["worker thread<br/>python-multipart + zipstream-ng"] --> d4["OutputChannel<br/>(deque, thread-safe)"] --> d5["drain task<br/>send()"]
+    end
+```
+
+| | claude | grok | dsh |
+|---|---|---|---|
+| Multipart parsing | `python-multipart` (push), in a worker thread | hand-written (pull), on the event loop | `python-multipart`, in the worker thread |
+| Threads | `to_thread` per chunk | one zip thread per request | one parse+zip thread per request |
+| Hand-off to the thread | awaits each chunk | 4-slot queue, sleeps 100 ms when full | 2-slot queue, sleeps 5 ms when full |
+| Zip writer | stdlib `zipfile` | stdlib `zipfile` | `zipstream-ng`, pull-driven |
+| 100 MiB random data | 36.8 MiB/s | 3.0 MiB/s | about 37 MiB/s |
+| 500 × 4 KiB files | 0.10 s | 37.7 s | 0.14 s |
+| Test coverage | 97% | 89% | 93% |
 
 ## Deployment
+Each service repository deploys only itself, onto a shared platform defined in this repository. The services' deploy workflows are the same template; what differs between them is CI and the image (see each section above).
+
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
+flowchart TB
+    U["Browser / API client"] -->|HTTPS| R53["Route 53<br/>zip-agents.com"]
+    R53 --> ALB["ALB<br/>ACM cert, HTTP to HTTPS"]
+    subgraph VPC["VPC, eu-west-2, 2 AZs"]
+        ALB --> GW["gateway<br/>ECS Fargate"]
+        GW -->|"Cloud Map<br/>zip.internal"| CL["claude"]
+        GW --> GR["grok"]
+        GW --> DS["dsh"]
+        GW --> DB[("Aurora PG<br/>Serverless v2, 0-2 ACU")]
+    end
+    GW --> COG["Cognito<br/>portal sign-in"]
+    GW --> SM["Secrets Manager<br/>API keys, session secret"]
+    BUD["Budget $50"] -->|100%| KS["kill-switch Lambda<br/>scale all to 0"]
+    NUKE["nuke workflow<br/>daily, from NUKE_AFTER"] -.->|terraform destroy| VPC
+```
+
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "13px"}, "flowchart": {"nodeSpacing": 25, "rankSpacing": 30, "padding": 6}}}%%
+flowchart LR
+    subgraph Each service repo
+        PR["pull request"] --> CI["CI"]
+        PR --> PLAN["terraform plan<br/>(plan role)"]
+        MAIN["push to main"] --> CI2["CI"] -->|success| DEP["deploy (prod env, main only):<br/>push to ECR, terraform apply,<br/>smoke check"]
+    end
+    subgraph api-gateway
+        GPR["pull request"] --> GPLAN["plan platform + gateway"]
+        GMAIN["push to main"] --> GAPPLY["apply platform, then gateway"]
+        MAN["manual"] --> INT["integration: all 3 locally"]
+        MAN --> LIVE["live-smoke against prod"]
+    end
+    DEP & GAPPLY -->|"GitHub OIDC token<br/>(no stored keys)"| STS["AWS STS<br/>role per repo, least privilege"]
+```
